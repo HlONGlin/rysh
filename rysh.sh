@@ -144,9 +144,35 @@ self_install() {
             cp "$abs" /usr/local/bin/rysh 2>/dev/null && chmod 755 /usr/local/bin/rysh 2>/dev/null
         fi
     elif [ -x /usr/local/bin/rysh ]; then
+        install_shortcut
         return 0
     fi
     [ -x /usr/local/bin/rysh ] || warn "请将脚本安装到 /usr/local/bin/rysh，否则定时任务无法运行"
+    install_shortcut
+}
+
+install_shortcut() {
+    [ -x /usr/local/bin/rysh ] || return 0
+    if [ -e /usr/local/bin/ry ] || [ -L /usr/local/bin/ry ]; then
+        target=$(readlink /usr/local/bin/ry 2>/dev/null)
+        if [ "$target" = "/usr/local/bin/rysh" ]; then
+            return 0
+        fi
+        if [ -f /usr/local/bin/ry ] && ! [ -L /usr/local/bin/ry ]; then
+            warn "/usr/local/bin/ry 已存在且不是 rysh 的链接，跳过快捷命令创建"
+            return 0
+        fi
+    fi
+    ln -sf /usr/local/bin/rysh /usr/local/bin/ry 2>/dev/null && return 0
+    cp /usr/local/bin/rysh /usr/local/bin/ry 2>/dev/null && chmod 755 /usr/local/bin/ry 2>/dev/null
+}
+
+remove_shortcut() {
+    if [ -L /usr/local/bin/ry ]; then
+        rm -f /usr/local/bin/ry
+    elif [ -f /usr/local/bin/ry ]; then
+        cmp -s /usr/local/bin/ry /usr/local/bin/rysh 2>/dev/null && rm -f /usr/local/bin/ry
+    fi
 }
 
 ensure_deps() {
@@ -251,12 +277,14 @@ install_xray() {
     if [ -x "$XRAY_BIN" ]; then
         cur=$("$XRAY_BIN" version 2>/dev/null | head -n 1)
         msg "当前 Xray: $cur"
-        printf '是否更新到最新版本? [y/N]: '
-        read -r ans 2>/dev/null || ans=""
-        case "$ans" in
-            y|Y|yes|YES) ;;
-            *) return 0 ;;
-        esac
+        if [ "${RYSH_ASSUME_YES:-0}" != "1" ]; then
+            printf '是否更新到最新版本? [y/N]: '
+            read -r ans 2>/dev/null || ans=""
+            case "$ans" in
+                y|Y|yes|YES) ;;
+                *) return 0 ;;
+            esac
+        fi
     fi
 
     tmp=$(mktemp -d 2>/dev/null) || die "无法创建临时目录"
@@ -2258,6 +2286,128 @@ test_nodes() {
     done
 }
 
+service_start() {
+    if openrc_active; then
+        rc-service rysh start >/dev/null 2>&1 || true
+        rc-service xray start >/dev/null 2>&1 || true
+        wait_xray_start
+        return $?
+    fi
+    xray_start
+    apply_tc_all
+    monitor_run --quiet
+    wait_xray_start
+}
+
+service_stop() {
+    if openrc_active; then
+        rc-service xray stop >/dev/null 2>&1 || true
+        rc-service rysh stop >/dev/null 2>&1 || true
+        return 0
+    fi
+    xray_stop
+    clear_all
+}
+
+service_status() {
+    printf 'Xray  : %s\n' "$(xray_status_text)"
+    if openrc_active; then
+        printf 'rysh  : %s\n' "$(rc-service rysh status 2>&1 | head -n 1)"
+        printf 'crond : %s\n' "$(rc-service crond status 2>&1 | head -n 1)"
+    fi
+}
+
+reset_all_credentials() {
+    require_root
+    require_xray
+    ensure_dirs
+    ids=$(node_ids)
+    if [ -z "$ids" ]; then
+        warn "还没有节点，无需重置"
+        return 1
+    fi
+    count=$(printf '%s\n' $ids | wc -l | tr -d ' ')
+    if [ "${RYSH_ASSUME_YES:-0}" != "1" ]; then
+        printf '将重置 %s 个节点的 UUID、ShortID 与 Reality 密钥，客户端需重新导入。继续? [y/N]: ' "$count"
+        read -r a 2>/dev/null || a=""
+        case "$a" in
+            y|Y) ;;
+            *) warn "已取消"; return 1 ;;
+        esac
+    fi
+
+    changed=0
+    failed=0
+    for id in $ids; do
+        load_node "$id" || continue
+        u=$(gen_uuid)
+        keys=$(gen_keys)
+        sid=$(gen_shortid)
+        if [ -z "$u" ] || [ -z "$keys" ] || [ -z "$sid" ]; then
+            warn "节点 $id 凭据生成失败，已跳过"
+            failed=$((failed + 1))
+            continue
+        fi
+        N_UUID="$u"
+        N_PRIV=${keys%%|*}
+        N_PUB=${keys#*|}
+        N_SID="$sid"
+        save_node || {
+            warn "节点 $id 保存失败"
+            failed=$((failed + 1))
+            continue
+        }
+        changed=$((changed + 1))
+    done
+
+    if [ "$changed" -eq 0 ]; then
+        err "没有节点被重置"
+        return 1
+    fi
+    log_event "reset credentials for $changed nodes"
+    apply_config || {
+        warn "凭据已保存，但配置应用失败，请执行 rysh apply"
+        return 1
+    }
+    monitor_run --quiet
+    ok "已重置 $changed 个节点的凭据，节点数据保留$([ "$failed" -gt 0 ] && printf '（%s 个失败）' "$failed")"
+
+    CACHED_IP=$(get_public_ip)
+    for id in $ids; do
+        load_node "$id" || continue
+        printf '\n[%s] %s\n%s\n' "$N_ID" "$N_NAME" "$(build_link)"
+    done
+    unset CACHED_IP
+    return 0
+}
+
+uninstall_keep_config() {
+    remove_cron
+    if openrc_active; then
+        rc-service rysh stop >/dev/null 2>&1 || true
+        rc-update del rysh default >/dev/null 2>&1 || true
+    fi
+    clear_all
+    remove_shortcut
+    rm -f /etc/init.d/rysh /usr/local/bin/rysh
+    ok "rysh 已卸载，配置保留在 $RYSH_DIR"
+}
+
+purge_all() {
+    remove_cron
+    xray_stop
+    if openrc_active; then
+        rc-update del xray default >/dev/null 2>&1 || true
+        rc-update del rysh default >/dev/null 2>&1 || true
+        rc-service rysh stop >/dev/null 2>&1 || true
+    fi
+    clear_all
+    remove_shortcut
+    rm -f /etc/init.d/xray /etc/init.d/rysh /usr/local/bin/xray /usr/local/bin/xray.bak /usr/local/bin/rysh
+    rm -rf "$RYSH_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR"
+    ok "完全卸载完成"
+}
+
 uninstall_menu() {
     clear_screen
     printf '%s卸载%s\n\n' "$C_BOLD" "$C_NC"
@@ -2270,14 +2420,7 @@ uninstall_menu() {
             printf '确认卸载 rysh? [y/N]: '
             read -r a 2>/dev/null || a=""
             case "$a" in y|Y) ;; *) return 0 ;; esac
-            remove_cron
-            if openrc_active; then
-                rc-service rysh stop >/dev/null 2>&1 || true
-                rc-update del rysh default >/dev/null 2>&1 || true
-            fi
-            clear_all
-            rm -f /etc/init.d/rysh /usr/local/bin/rysh
-            ok "rysh 已卸载，配置保留在 $RYSH_DIR"
+            uninstall_keep_config
             exit 0
             ;;
         2)
@@ -2290,17 +2433,7 @@ uninstall_menu() {
                 warn "已取消"
                 return 0
             }
-            remove_cron
-            xray_stop
-            if openrc_active; then
-                rc-update del xray default >/dev/null 2>&1 || true
-                rc-update del rysh default >/dev/null 2>&1 || true
-                rc-service rysh stop >/dev/null 2>&1 || true
-            fi
-            clear_all
-            rm -f /etc/init.d/xray /etc/init.d/rysh /usr/local/bin/xray /usr/local/bin/xray.bak /usr/local/bin/rysh
-            rm -rf "$RYSH_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR"
-            ok "完全卸载完成"
+            purge_all
             exit 0
             ;;
         0) return 0 ;;
@@ -2380,7 +2513,7 @@ main_menu() {
             23) uninstall_menu ;;
             24) edit_config; pause ;;
             25) test_nodes; pause ;;
-            0) exit 0 ;;
+            0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
     done
@@ -2391,16 +2524,27 @@ usage() {
 rysh - Xray Reality 多节点管理脚本 (Alpine Linux)
 
 用法:
-  rysh                 进入交互菜单
-  rysh install         安装/更新 Xray
-  rysh monitor         统计流量并执行限额/到期策略
-  rysh apply           应用限速和防火墙规则
-  rysh clear           清除限速和防火墙规则
-  rysh gen             输出生成的 Xray 配置
-  rysh list            列出节点
-  rysh start|stop|restart|status
-  rysh version         显示脚本版本
+  ry                       进入交互菜单（rysh 的快捷命令）
+  rysh                     进入交互菜单
+  rysh install [--yes]     安装/更新 Xray 与依赖
+  rysh monitor [--quiet]   统计流量并执行限额/到期策略
+  rysh apply               应用限速和防火墙规则
+  rysh clear               清除限速和防火墙规则
+  rysh gen                 输出生成的 Xray 配置
+  rysh list                列出节点
+  rysh start|stop|restart  启动/停止/重启服务
+  rysh status              查看服务状态与日志
+  rysh reset-credentials   重置全部节点凭据（保留节点数据）
+  rysh uninstall [--purge] [--yes]
+                           卸载 rysh；--purge 同时删除 Xray 与全部数据
+  rysh version             显示脚本版本
 USAGE_EOF
+}
+
+assume_yes_arg() {
+    case "${1:-}" in
+        -y|--yes|-f|--force) RYSH_ASSUME_YES=1 ;;
+    esac
 }
 
 case "${1:-}" in
@@ -2415,6 +2559,7 @@ case "${1:-}" in
         require_root
         ensure_dirs
         load_settings
+        assume_yes_arg "${2:-}"
         install_xray
         ;;
     monitor)
@@ -2450,23 +2595,78 @@ case "${1:-}" in
         ;;
     start)
         require_root
+        ensure_dirs
         load_settings
-        xray_start
+        if service_start; then
+            ok "服务已启动"
+        else
+            err "服务启动失败，请查看 $XRAY_LOG_DIR/error.log"
+            exit 1
+        fi
         ;;
     stop)
         require_root
         load_settings
-        xray_stop
+        service_stop
+        ok "服务已停止"
         ;;
     restart)
         require_root
+        ensure_dirs
         load_settings
-        xray_restart
+        service_stop
+        if service_start; then
+            ok "服务已重启"
+        else
+            err "服务重启失败，请查看 $XRAY_LOG_DIR/error.log"
+            exit 1
+        fi
         ;;
     status)
         require_root
         load_settings
-        xray_status_log
+        service_status
+        ;;
+    reset-credentials)
+        require_root
+        ensure_dirs
+        load_settings
+        assume_yes_arg "${2:-}"
+        reset_all_credentials
+        ;;
+    uninstall)
+        require_root
+        ensure_dirs
+        load_settings
+        mode="keep"
+        for arg in "$@"; do
+            case "$arg" in
+                --purge) mode="purge" ;;
+                -y|--yes|-f|--force) RYSH_ASSUME_YES=1 ;;
+            esac
+        done
+        if [ "${RYSH_ASSUME_YES:-0}" != "1" ]; then
+            if [ "$mode" = "purge" ]; then
+                printf '确认完全卸载? 所有节点配置和 Xray 将被删除，输入 DELETE 继续: '
+                read -r a 2>/dev/null || a=""
+                [ "$a" = "DELETE" ] || {
+                    warn "已取消"
+                    exit 1
+                }
+            else
+                printf '确认卸载 rysh? 节点配置会保留 [y/N]: '
+                read -r a 2>/dev/null || a=""
+                case "$a" in
+                    y|Y) ;;
+                    *) warn "已取消"; exit 1 ;;
+                esac
+            fi
+        fi
+        if [ "$mode" = "purge" ]; then
+            purge_all
+        else
+            uninstall_keep_config
+        fi
         ;;
     version|-v|--version)
         printf '%s\n' "$RYSH_VERSION"
