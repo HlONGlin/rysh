@@ -1,6 +1,6 @@
 #!/bin/sh
 
-RYSH_VERSION="1.0.0"
+RYSH_VERSION="1.0.1"
 RYSH_DIR="/etc/rysh"
 NODE_DIR="$RYSH_DIR/nodes"
 STATE_DIR="$RYSH_DIR/state"
@@ -345,16 +345,21 @@ install_xray() {
     fi
     touch "$MANAGED_MARK"
 
-    if [ ! -f "$XRAY_CONF" ]; then
-        gen_config > "$XRAY_CONF" || die "生成默认配置失败"
-        chmod 600 "$XRAY_CONF"
-    fi
-    if ! validate_config "$XRAY_CONF"; then
-        warn "现有配置校验失败，尝试重新生成"
-        gen_config > "$XRAY_CONF" || die "生成配置失败"
-        chmod 600 "$XRAY_CONF"
-        if ! validate_config "$XRAY_CONF"; then
+    if [ ! -f "$XRAY_CONF" ] || ! validate_config "$XRAY_CONF"; then
+        [ -f "$XRAY_CONF" ] && warn "现有配置校验失败，尝试重新生成"
+        tmp_cfg="$XRAY_CONF.tmp.$$.json"
+        gen_config > "$tmp_cfg" || {
+            rm -f "$tmp_cfg"
+            die "生成默认配置失败"
+        }
+        if ! validate_config_verbose "$tmp_cfg"; then
+            rm -f "$tmp_cfg"
             die "Xray 配置校验失败，请查看 $XRAY_LOG_DIR/error.log"
+        fi
+        chmod 600 "$tmp_cfg"
+        if ! mv "$tmp_cfg" "$XRAY_CONF"; then
+            rm -f "$tmp_cfg"
+            die "写入 Xray 配置失败"
         fi
     fi
 
@@ -376,6 +381,13 @@ validate_config() {
     [ -x "$XRAY_BIN" ] || return 1
     "$XRAY_BIN" run -test -c "$1" >/dev/null 2>&1 && return 0
     "$XRAY_BIN" -test -c "$1" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+validate_config_verbose() {
+    [ -x "$XRAY_BIN" ] || return 1
+    out=$("$XRAY_BIN" run -test -c "$1" 2>&1) && return 0
+    printf '%s\n' "$out" | grep -Ev '^(Xray |A unified platform|$)' >&2
     return 1
 }
 
@@ -886,13 +898,13 @@ apply_config() {
         warn "检测到非 rysh 管理的配置，已备份原文件"
     fi
     touch "$MANAGED_MARK"
-    tmp="$XRAY_CONF.tmp.$$"
+    tmp="$XRAY_CONF.tmp.$$.json"
     if ! gen_config > "$tmp"; then
         rm -f "$tmp"
         err "生成配置失败"
         return 1
     fi
-    if ! validate_config "$tmp"; then
+    if ! validate_config_verbose "$tmp"; then
         err "Xray 配置校验失败，已保留旧配置"
         rm -f "$tmp"
         return 1

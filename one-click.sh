@@ -1,6 +1,6 @@
 #!/bin/sh
 
-ONECLICK_VERSION="1.0.0"
+ONECLICK_VERSION="1.0.1"
 REPO_RAW="${RYSH_REPO_RAW:-https://github.com/HlONGlin/rysh/raw/main}"
 RYSH_BIN="/usr/local/bin/rysh"
 RYSH_SRC_URL="$REPO_RAW/rysh.sh"
