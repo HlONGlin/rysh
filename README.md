@@ -105,13 +105,13 @@ iproute2-tc iproute2-ss qrencode
 |------|--------|
 | 流控 | `xtls-rprx-vision` |
 | 客户端指纹 | `chrome` |
-| SNI | `www.microsoft.com` |
-| 目标地址 | `www.microsoft.com:443` |
+| SNI | `www.amazon.com` |
+| 目标地址 | `www.amazon.com:443` |
 | 限速 | 不限 |
 | 月限额 | 不限 |
 | 到期时间 | 永久 |
 
-Reality 的目标站点需要支持 TLS 1.3 和 HTTP/2，并且能从你的服务器正常访问。常见可用目标包括 `www.microsoft.com`、`www.apple.com`、`www.cloudflare.com` 等。
+Reality 的目标站点需要支持 TLS 1.3 和 HTTP/2，并且能从你的服务器正常访问。默认使用 `www.amazon.com`，其他常见可用目标包括 `www.microsoft.com`、`www.apple.com`、`www.cloudflare.com` 等。
 
 ## 节点管理菜单
 

@@ -97,7 +97,7 @@ ensure_dirs() {
 
 load_settings() {
     PUBLIC_IP=""
-    DEFAULT_SNI="www.microsoft.com"
+    DEFAULT_SNI="www.amazon.com"
     DEFAULT_FLOW="xtls-rprx-vision"
     DEFAULT_FP="chrome"
     MONITOR_INTERVAL="1"
@@ -106,7 +106,7 @@ load_settings() {
     if [ -f "$SETTINGS_FILE" ]; then
         . "$SETTINGS_FILE"
     fi
-    [ -n "$DEFAULT_SNI" ] || DEFAULT_SNI="www.microsoft.com"
+    [ -n "$DEFAULT_SNI" ] || DEFAULT_SNI="www.amazon.com"
     [ -n "$DEFAULT_FLOW" ] || DEFAULT_FLOW="xtls-rprx-vision"
     [ -n "$DEFAULT_FP" ] || DEFAULT_FP="chrome"
     is_uint "$MONITOR_INTERVAL" || MONITOR_INTERVAL="1"
