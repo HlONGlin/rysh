@@ -1,12 +1,13 @@
 #!/bin/sh
 
-RYSH_VERSION="1.0.1"
+RYSH_VERSION="1.0.2"
 RYSH_DIR="/etc/rysh"
 NODE_DIR="$RYSH_DIR/nodes"
 STATE_DIR="$RYSH_DIR/state"
 HISTORY_DIR="$RYSH_DIR/history"
 SETTINGS_FILE="$RYSH_DIR/settings.conf"
 BLOCKED_FILE="$RYSH_DIR/blocked.ports"
+TC_STATE_FILE="$RYSH_DIR/tc.state"
 EVENT_LOG="$RYSH_DIR/events.log"
 LOCK_DIR="/var/lock/rysh.lock"
 MANAGED_MARK="$RYSH_DIR/.managed"
@@ -18,6 +19,8 @@ XRAY_ASSET_DIR="/usr/local/share/xray"
 XRAY_LOG_DIR="/var/log/xray"
 API_ADDR="127.0.0.1:10085"
 API_PORT="10085"
+TC_CHAIN="1381589832"
+TC_PREF_BASE="1"
 
 if [ -t 1 ]; then
     C_RED=$(printf '\033[31m')
@@ -564,14 +567,25 @@ load_state() {
     S_MONTH=""
     S_MONTH_UP="0"
     S_MONTH_DOWN="0"
+    S_LAST_UP="0"
+    S_LAST_DOWN="0"
+    S_XRAY_GEN=""
+    S_HAS_BASELINE="0"
+    S_LEGACY_STATE="0"
     S_BLOCK_REASON=""
     f="$STATE_DIR/$1.state"
     [ -f "$f" ] || return 0
+    grep -q '^S_HAS_BASELINE=' "$f" 2>/dev/null || S_LEGACY_STATE="1"
     . "$f"
     S_TOTAL_UP=${S_TOTAL_UP:-0}
     S_TOTAL_DOWN=${S_TOTAL_DOWN:-0}
     S_MONTH_UP=${S_MONTH_UP:-0}
     S_MONTH_DOWN=${S_MONTH_DOWN:-0}
+    S_LAST_UP=${S_LAST_UP:-0}
+    S_LAST_DOWN=${S_LAST_DOWN:-0}
+    S_XRAY_GEN=${S_XRAY_GEN:-}
+    S_HAS_BASELINE=${S_HAS_BASELINE:-0}
+    S_LEGACY_STATE=${S_LEGACY_STATE:-0}
     S_BLOCK_REASON=${S_BLOCK_REASON:-}
 }
 
@@ -584,6 +598,11 @@ save_state() {
         printf "S_MONTH='%s'\n" "$S_MONTH"
         printf "S_MONTH_UP='%s'\n" "$S_MONTH_UP"
         printf "S_MONTH_DOWN='%s'\n" "$S_MONTH_DOWN"
+        printf "S_LAST_UP='%s'\n" "$S_LAST_UP"
+        printf "S_LAST_DOWN='%s'\n" "$S_LAST_DOWN"
+        printf "S_XRAY_GEN='%s'\n" "$S_XRAY_GEN"
+        printf "S_HAS_BASELINE='%s'\n" "$S_HAS_BASELINE"
+        printf "S_LEGACY_STATE='%s'\n" "$S_LEGACY_STATE"
         printf "S_BLOCK_REASON='%s'\n" "$(sanitize_text "$S_BLOCK_REASON")"
     } > "$tmp" || return 1
     mv "$tmp" "$STATE_DIR/$N_ID.state"
@@ -931,28 +950,69 @@ apply_config() {
 }
 
 stats_query() {
-    reset="$1"
     if need_cmd timeout; then
-        if [ "$reset" = "1" ]; then
-            timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" -reset 2>/dev/null
-        else
-            timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
-        fi
+        timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
     else
-        if [ "$reset" = "1" ]; then
-            "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" -reset 2>/dev/null
-        else
-            "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
-        fi
+        "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
     fi
 }
 
-stats_reset_user() {
+stats_query_user() {
     uid="$1"
     if need_cmd timeout; then
-        timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>n$uid>>>" -reset >/dev/null 2>&1
+        timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>n$uid>>>" 2>/dev/null
     else
-        "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>n$uid>>>" -reset >/dev/null 2>&1
+        "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>n$uid>>>" 2>/dev/null
+    fi
+}
+
+stats_user_baseline() {
+    uid="$1"
+    json=$(stats_query_user "$uid") || return 1
+    printf '%s' "$json" | jq -e . >/dev/null 2>&1 || return 1
+    up=$(printf '%s' "$json" | jq -r --arg n "user>>>n$uid>>>traffic>>>uplink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
+    down=$(printf '%s' "$json" | jq -r --arg n "user>>>n$uid>>>traffic>>>downlink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
+    is_uint "$up" || up=0
+    is_uint "$down" || down=0
+    printf '%s %s\n' "$up" "$down"
+}
+
+reset_user_baseline() {
+    uid="$1"
+    baseline=$(stats_user_baseline "$uid") || return 1
+    S_LAST_UP=${baseline%% *}
+    S_LAST_DOWN=${baseline#* }
+    S_XRAY_GEN=$(xray_generation 2>/dev/null)
+    S_HAS_BASELINE="1"
+    S_LEGACY_STATE="0"
+}
+
+xray_generation() {
+    pid=$(cat /run/xray.pid 2>/dev/null)
+    if ! is_uint "$pid" || ! kill -0 "$pid" 2>/dev/null; then
+        pid=""
+        if need_cmd pidof; then
+            pid=$(pidof xray 2>/dev/null | awk '{print $1}')
+        elif need_cmd pgrep; then
+            pid=$(pgrep -xo xray 2>/dev/null)
+        fi
+    fi
+    is_uint "$pid" || return 1
+    [ -r "/proc/$pid/stat" ] || return 1
+    start=$(awk '{sub(/^.*\) /, ""); print $20}' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$start" ] || return 1
+    printf '%s' "$start"
+}
+
+counter_delta() {
+    current="$1"
+    previous="$2"
+    old_generation="$3"
+    new_generation="$4"
+    if [ -n "$old_generation" ] && [ -n "$new_generation" ] && [ "$old_generation" != "$new_generation" ]; then
+        awk -v c="$current" 'BEGIN{printf "%.0f", c+0}'
+    else
+        awk -v c="$current" -v p="$previous" 'BEGIN{d=(c+0)-(p+0); if(d<0)d=c+0; printf "%.0f", d}'
     fi
 }
 
@@ -960,6 +1020,12 @@ get_stat() {
     f="$1"
     k="$2"
     awk -v k="$k" '$1==k {print $2; found=1; exit} END{if(!found) print 0}' "$f" 2>/dev/null
+}
+
+stat_exists() {
+    f="$1"
+    k="$2"
+    awk -v k="$k" '$1==k {found=1; exit} END{exit !found}' "$f" 2>/dev/null
 }
 
 quota_exceeded() {
@@ -983,7 +1049,38 @@ node_status() {
         printf '超月限额'
         return
     fi
+    if is_uint "$N_EXPIRES" && [ "$N_EXPIRES" -gt 0 ]; then
+        remain=$(( (N_EXPIRES - now + 86399) / 86400 ))
+        if [ "$remain" -le 7 ]; then
+            printf '即将到期(%s天)' "$remain"
+            return
+        fi
+    fi
     printf '正常'
+}
+
+status_color() {
+    case "$1" in
+        正常) printf '%s' "$C_GREEN" ;;
+        即将到期*) printf '%s' "$C_YELLOW" ;;
+        已禁用|已到期|超月限额) printf '%s' "$C_RED" ;;
+        *) printf '%s' "$C_YELLOW" ;;
+    esac
+}
+
+quota_progress() {
+    quota="$N_QUOTA_GB"
+    if is_zero_number "$quota"; then
+        printf '不限'
+        return
+    fi
+    used=$(month_used_bytes)
+    awk -v u="$used" -v q="$quota" 'BEGIN {
+        limit=q*1073741824
+        pct=(limit>0)?int((u*100)/limit):0
+        if(pct>100)pct=100
+        printf "%s / %s GB (%d%%)", sprintf("%.2f",u/1073741824),q,pct
+    }'
 }
 
 archive_month() {
@@ -1086,9 +1183,28 @@ apply_blocklist() {
     return 1
 }
 
-apply_tc_all() {
-    dev="$IFACE"
-    [ -n "$dev" ] || dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+tc_clear_owned() {
+    need_cmd tc || return 1
+    if [ -f "$TC_STATE_FILE" ]; then
+        while read -r olddev oldid oldpref; do
+            [ -n "$olddev" ] || continue
+            if is_uint "$oldpref"; then
+                tc filter del dev "$olddev" egress chain "$TC_CHAIN" pref "$oldpref" 2>/dev/null || true
+                tc filter del dev "$olddev" ingress chain "$TC_CHAIN" pref "$oldpref" 2>/dev/null || true
+            fi
+            tc filter flush dev "$olddev" egress chain "$TC_CHAIN" 2>/dev/null || true
+            tc filter flush dev "$olddev" ingress chain "$TC_CHAIN" 2>/dev/null || true
+        done < "$TC_STATE_FILE"
+    fi
+    current="$IFACE"
+    [ -n "$current" ] || current=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    if [ -n "$current" ]; then
+        tc filter flush dev "$current" egress chain "$TC_CHAIN" 2>/dev/null || true
+        tc filter flush dev "$current" ingress chain "$TC_CHAIN" 2>/dev/null || true
+    fi
+}
+
+apply_tc_rules() {
     has_rate=0
     for id in $(node_ids); do
         en=$(node_get_field "$id" N_ENABLED)
@@ -1097,10 +1213,16 @@ apply_tc_all() {
         [ -n "$r" ] && awk -v r="$r" 'BEGIN{exit !(r+0>0)}' && has_rate=1
     done
     if ! need_cmd tc; then
-        if [ "$has_rate" -eq 1 ]; then
+        if [ "$has_rate" -eq 1 ] || [ -s "$TC_STATE_FILE" ]; then
             warn "未安装 tc，无法应用限速 (apk add iproute2-tc)"
             return 1
         fi
+        return 0
+    fi
+    ensure_dirs
+    if [ "$has_rate" -eq 0 ]; then
+        tc_clear_owned || true
+        : > "$TC_STATE_FILE"
         return 0
     fi
     if ! need_cmd ip; then
@@ -1110,44 +1232,26 @@ apply_tc_all() {
         fi
         return 0
     fi
+    dev="$IFACE"
+    [ -n "$dev" ] || dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
     if [ -z "$dev" ]; then
-        if [ "$has_rate" -eq 1 ]; then
-            warn "无法检测默认网卡，请在全局设置中指定网卡"
-            return 1
-        fi
-        return 0
-    fi
-
-    tc qdisc del dev "$dev" root 2>/dev/null || true
-    tc qdisc del dev "$dev" ingress 2>/dev/null || true
-    ip link del ifb0 2>/dev/null || true
-    [ "$has_rate" -eq 0 ] && return 0
-
-    modprobe sch_htb 2>/dev/null || true
-    if ! tc qdisc add dev "$dev" root handle 1: htb default ffff 2>/dev/null; then
-        warn "创建 egress 限速队列失败"
+        warn "无法检测默认网卡，请在全局设置中指定网卡"
         return 1
     fi
-    tc class add dev "$dev" parent 1: classid 1:ffff htb rate 100gbit ceil 100gbit 2>/dev/null || true
 
-    ingress_ok=0
-    modprobe ifb 2>/dev/null || true
-    if ip link add ifb0 type ifb 2>/dev/null; then
-        ip link set ifb0 up 2>/dev/null || true
-        if tc qdisc add dev "$dev" handle ffff: ingress 2>/dev/null; then
-            if ! tc filter add dev "$dev" parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null; then
-                tc filter add dev "$dev" parent ffff: protocol ip prio 1 u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
-            fi
-            if tc qdisc add dev ifb0 root handle 2: htb default ffff 2>/dev/null; then
-                tc class add dev ifb0 parent 2: classid 2:ffff htb rate 100gbit ceil 100gbit 2>/dev/null || true
-                ingress_ok=1
-            else
-                tc qdisc del dev "$dev" ingress 2>/dev/null || true
-                ip link del ifb0 2>/dev/null || true
-            fi
-        fi
+    if ! tc qdisc add dev "$dev" clsact 2>/dev/null; then
+        tc qdisc show dev "$dev" | grep -q 'clsact' || {
+            warn "无法创建 clsact qdisc，未应用限速"
+            return 1
+        }
     fi
 
+    tc_clear_owned || true
+    tc filter flush dev "$dev" egress chain "$TC_CHAIN" 2>/dev/null || true
+    tc filter flush dev "$dev" ingress chain "$TC_CHAIN" 2>/dev/null || true
+
+    state_tmp="$TC_STATE_FILE.tmp.$$"
+    : > "$state_tmp"
     for id in $(node_ids); do
         load_node "$id" || continue
         [ "$N_ENABLED" = "1" ] || continue
@@ -1155,36 +1259,50 @@ apply_tc_all() {
         [ -n "$rate" ] && [ "$rate" != "0" ] || continue
         kbit=$(awk -v m="$rate" 'BEGIN{printf "%d", m*1000}')
         [ "$kbit" -gt 0 ] 2>/dev/null || continue
-
-        if ! tc class add dev "$dev" parent 1: classid "1:$id" htb rate "${kbit}kbit" ceil "${kbit}kbit" 2>/dev/null; then
-            warn "节点 $id egress 限速类创建失败"
+        is_uint "$id" || continue
+        pref=$((TC_PREF_BASE + id))
+        [ "$pref" -le 65535 ] || {
+            warn "节点 $id ID 超出 tc 优先级范围，未应用限速"
             continue
-        fi
-        if ! tc filter add dev "$dev" parent 1: protocol all prio 1 flower ip_proto tcp src_port "$N_PORT" flowid "1:$id" 2>/dev/null; then
-            tc filter add dev "$dev" parent 1: protocol ip prio 1 u32 match ip sport "$N_PORT" 0xffff flowid "1:$id" 2>/dev/null || warn "节点 $id egress 过滤规则创建失败"
+        }
+
+        added=0
+        if tc filter add dev "$dev" egress chain "$TC_CHAIN" protocol all pref "$pref" flower ip_proto tcp src_port "$N_PORT" action police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            added=1
+        elif tc filter add dev "$dev" egress chain "$TC_CHAIN" protocol ip pref "$pref" u32 match ip sport "$N_PORT" 0xffff police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            added=1
+        else
+            warn "节点 $id egress 限速规则创建失败"
         fi
 
-        if [ "$ingress_ok" -eq 1 ]; then
-            if ! tc class add dev ifb0 parent 2: classid "2:$id" htb rate "${kbit}kbit" ceil "${kbit}kbit" 2>/dev/null; then
-                continue
-            fi
-            if ! tc filter add dev ifb0 parent 2: protocol all prio 1 flower ip_proto tcp dst_port "$N_PORT" flowid "2:$id" 2>/dev/null; then
-                tc filter add dev ifb0 parent 2: protocol ip prio 1 u32 match ip dport "$N_PORT" 0xffff flowid "2:$id" 2>/dev/null || warn "节点 $id ingress 过滤规则创建失败"
-            fi
+        if tc filter add dev "$dev" ingress chain "$TC_CHAIN" protocol all pref "$pref" flower ip_proto tcp dst_port "$N_PORT" action police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            added=1
+        elif tc filter add dev "$dev" ingress chain "$TC_CHAIN" protocol ip pref "$pref" u32 match ip dport "$N_PORT" 0xffff police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            added=1
+        else
+            warn "节点 $id ingress 限速规则创建失败"
+        fi
+        if [ "$added" -eq 1 ]; then
+            printf '%s %s %s\n' "$dev" "$id" "$pref" >> "$state_tmp"
         fi
     done
-    log_event "tc rules applied on $dev"
+    mv "$state_tmp" "$TC_STATE_FILE"
+    log_event "tc police rules applied on $dev"
     return 0
+}
+
+apply_tc_all() {
+    acquire_lock || return 1
+    apply_tc_rules "$@"
+    rc=$?
+    release_lock
+    return "$rc"
 }
 
 clear_tc() {
     need_cmd tc || return 0
-    dev="$IFACE"
-    [ -n "$dev" ] || dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
-    [ -n "$dev" ] || return 0
-    tc qdisc del dev "$dev" root 2>/dev/null || true
-    tc qdisc del dev "$dev" ingress 2>/dev/null || true
-    ip link del ifb0 2>/dev/null || true
+    tc_clear_owned || true
+    : > "$TC_STATE_FILE"
 }
 
 clear_all() {
@@ -1212,10 +1330,25 @@ monitor_run() {
     month=$(date +%Y-%m)
     stats_file=$(mktemp 2>/dev/null) || stats_file="$RYSH_DIR/.stats.$$"
     stats_ok=0
+    xray_gen_before=$(xray_generation 2>/dev/null)
+    xray_gen="$xray_gen_before"
     if [ -x "$XRAY_BIN" ]; then
-        if json=$(stats_query 1); then
-            stats_ok=1
-            printf '%s' "$json" | jq -r '.stat[]? | "\(.name) \(.value)"' > "$stats_file" 2>/dev/null || true
+        if json=$(stats_query 0); then
+            xray_gen_after=$(xray_generation 2>/dev/null)
+            if [ -n "$xray_gen_before" ] && [ -n "$xray_gen_after" ] && [ "$xray_gen_before" != "$xray_gen_after" ]; then
+                if json=$(stats_query 0); then
+                    xray_gen=$(xray_generation 2>/dev/null)
+                    [ -n "$xray_gen" ] || xray_gen="$xray_gen_after"
+                    stats_ok=1
+                fi
+            else
+                xray_gen="$xray_gen_after"
+                [ -n "$xray_gen" ] || xray_gen="$xray_gen_before"
+                stats_ok=1
+            fi
+            if [ "$stats_ok" -eq 1 ]; then
+                printf '%s' "$json" | jq -r '.stat[]? | "\(.name) \(.value)"' > "$stats_file" 2>/dev/null || true
+            fi
         fi
     fi
     [ -f "$stats_file" ] || : > "$stats_file"
@@ -1232,12 +1365,47 @@ monitor_run() {
             S_MONTH_DOWN="0"
         fi
         if [ "$stats_ok" -eq 1 ]; then
-            up=$(get_stat "$stats_file" "user>>>n$id>>>traffic>>>uplink")
-            down=$(get_stat "$stats_file" "user>>>n$id>>>traffic>>>downlink")
-            S_TOTAL_UP=$(add_bytes "$S_TOTAL_UP" "$up")
-            S_TOTAL_DOWN=$(add_bytes "$S_TOTAL_DOWN" "$down")
-            S_MONTH_UP=$(add_bytes "$S_MONTH_UP" "$up")
-            S_MONTH_DOWN=$(add_bytes "$S_MONTH_DOWN" "$down")
+            up_key="user>>>n$id>>>traffic>>>uplink"
+            down_key="user>>>n$id>>>traffic>>>downlink"
+            up_present=0
+            down_present=0
+            stat_exists "$stats_file" "$up_key" && up_present=1
+            stat_exists "$stats_file" "$down_key" && down_present=1
+            up=0
+            down=0
+            delta_up=0
+            delta_down=0
+            if [ "$up_present" -eq 1 ]; then
+                up=$(get_stat "$stats_file" "$up_key")
+                if [ "$S_HAS_BASELINE" = "1" ]; then
+                    delta_up=$(counter_delta "$up" "$S_LAST_UP" "$S_XRAY_GEN" "$xray_gen")
+                elif [ "$S_LEGACY_STATE" = "1" ]; then
+                    delta_up=0
+                else
+                    delta_up=$(awk -v c="$up" 'BEGIN{printf "%.0f", c+0}')
+                fi
+            fi
+            if [ "$down_present" -eq 1 ]; then
+                down=$(get_stat "$stats_file" "$down_key")
+                if [ "$S_HAS_BASELINE" = "1" ]; then
+                    delta_down=$(counter_delta "$down" "$S_LAST_DOWN" "$S_XRAY_GEN" "$xray_gen")
+                elif [ "$S_LEGACY_STATE" = "1" ]; then
+                    delta_down=0
+                else
+                    delta_down=$(awk -v c="$down" 'BEGIN{printf "%.0f", c+0}')
+                fi
+            fi
+            if [ "$up_present" -eq 1 ] || [ "$down_present" -eq 1 ]; then
+                [ "$up_present" -eq 1 ] && S_LAST_UP=$(get_stat "$stats_file" "$up_key")
+                [ "$down_present" -eq 1 ] && S_LAST_DOWN=$(get_stat "$stats_file" "$down_key")
+                S_XRAY_GEN="$xray_gen"
+                S_HAS_BASELINE="1"
+                S_LEGACY_STATE="0"
+            fi
+            S_TOTAL_UP=$(add_bytes "$S_TOTAL_UP" "$delta_up")
+            S_TOTAL_DOWN=$(add_bytes "$S_TOTAL_DOWN" "$delta_down")
+            S_MONTH_UP=$(add_bytes "$S_MONTH_UP" "$delta_up")
+            S_MONTH_DOWN=$(add_bytes "$S_MONTH_DOWN" "$delta_down")
         fi
 
         reason=""
@@ -1547,23 +1715,19 @@ show_nodes() {
         warn "还没有节点，请先创建"
         return 0
     fi
+    printf '%-4s %-18s %-7s %-10s %-24s %-12s %s\n' 'ID' '名称' '端口' '状态' '本月用量 / 限额' '总流量' '到期'
+    printf '%s\n' '-----------------------------------------------------------------------------------------------'
     for id in $ids; do
         load_node "$id" || continue
         load_state "$id"
-        printf '%s[%s]%s %s  (端口 %s)  %s\n' "$C_BOLD" "$id" "$C_NC" "$N_NAME" "$N_PORT" "$(node_status)"
-        if is_zero_number "$N_QUOTA_GB"; then
-            q="不限"
-        else
-            q="$N_QUOTA_GB GB"
-        fi
-        if is_zero_number "$N_RATE_MBPS"; then
-            r="不限"
-        else
-            r="$N_RATE_MBPS Mbps"
-        fi
-        printf '     本月 %s / %s | 总计 %s | 到期 %s | 限速 %s\n' \
-            "$(human_bytes "$(month_used_bytes)")" "$q" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")" "$r"
+        state=$(node_status)
+        color=$(status_color "$state")
+        printf '%-4s %-18.18s %-7s %s%-10s%s %-24s %-12s %s\n' \
+            "$id" "$N_NAME" "$N_PORT" "$color" "$state" "$C_NC" \
+            "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")"
     done
+    printf '\n图例: %s正常%s  %s即将到期%s  %s已禁用/已到期/超月限额%s\n' \
+        "$C_GREEN" "$C_NC" "$C_YELLOW" "$C_NC" "$C_RED" "$C_NC"
 }
 
 show_link_menu() {
@@ -1809,7 +1973,18 @@ reset_traffic_menu() {
     case "$c" in
         1)
             acquire_lock || return 1
-            [ -x "$XRAY_BIN" ] && stats_reset_user "$id"
+            if xray_running; then
+                if ! reset_user_baseline "$id"; then
+                    release_lock
+                    err "无法读取 Xray 用户统计，未重置流量"
+                    return 1
+                fi
+            else
+                S_LAST_UP="0"
+                S_LAST_DOWN="0"
+                S_XRAY_GEN=""
+                S_HAS_BASELINE="1"
+            fi
             S_MONTH_UP="0"
             S_MONTH_DOWN="0"
             save_state
@@ -1819,7 +1994,18 @@ reset_traffic_menu() {
             ;;
         2)
             acquire_lock || return 1
-            [ -x "$XRAY_BIN" ] && stats_reset_user "$id"
+            if xray_running; then
+                if ! reset_user_baseline "$id"; then
+                    release_lock
+                    err "无法读取 Xray 用户统计，未重置流量"
+                    return 1
+                fi
+            else
+                S_LAST_UP="0"
+                S_LAST_DOWN="0"
+                S_XRAY_GEN=""
+                S_HAS_BASELINE="1"
+            fi
             S_TOTAL_UP="0"
             S_TOTAL_DOWN="0"
             S_MONTH_UP="0"
@@ -2034,9 +2220,27 @@ xray_control_menu() {
         printf '1. 启动\n2. 停止\n3. 重启\n4. 查看状态\n0. 返回\n请选择: '
         read -r c 2>/dev/null || c=""
         case "$c" in
-            1) xray_start; wait_xray_start; ok "启动完成，当前状态: $(xray_status_text)" ;;
-            2) xray_stop; ok "已停止" ;;
-            3) xray_restart; wait_xray_start; ok "重启完成，当前状态: $(xray_status_text)" ;;
+            1)
+                if xray_start && wait_xray_start; then
+                    ok "Xray 已启动"
+                else
+                    err "Xray 启动失败，请查看 $XRAY_LOG_DIR/error.log"
+                fi
+                ;;
+            2)
+                if xray_stop && ! xray_running; then
+                    ok "Xray 已停止"
+                else
+                    err "Xray 停止失败，请检查服务状态"
+                fi
+                ;;
+            3)
+                if xray_restart && wait_xray_start; then
+                    ok "Xray 已重启"
+                else
+                    err "Xray 重启失败，请查看 $XRAY_LOG_DIR/error.log"
+                fi
+                ;;
             4) xray_status_log ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -2474,14 +2678,26 @@ main_menu() {
         clear_screen
         node_count=$(node_ids | wc -l | tr -d ' ')
         month_total="0"
+        healthy_count=0
+        attention_count=0
+        disabled_count=0
         for id in $(node_ids); do
+            load_node "$id" || continue
             load_state "$id"
             month_total=$(add_bytes "$month_total" "$(month_used_bytes)")
+            case "$(node_status)" in
+                正常) healthy_count=$((healthy_count + 1)) ;;
+                已禁用) disabled_count=$((disabled_count + 1)) ;;
+                *) attention_count=$((attention_count + 1)) ;;
+            esac
         done
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
         printf '%s rysh %s - Xray Reality 多节点管理 (Alpine Linux)%s\n' "$C_BOLD" "$RYSH_VERSION" "$C_NC"
         printf ' 系统: %s | 节点: %s | Xray: %s | 本月总流量: %s\n' \
             "$(cat /etc/alpine-release 2>/dev/null || printf '未知')" "$node_count" "$(xray_status_text)" "$(human_bytes "$month_total")"
+        printf ' 节点状态: %s正常 %s%s待处理 %s%s已禁用%s\n' \
+            "$C_GREEN" "$healthy_count" "$C_NC" "$C_YELLOW" "$attention_count" "$C_NC"
+        printf '           %s%s已禁用%s\n' "$C_RED" "$disabled_count" "$C_NC"
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
         printf ' 1. 安装/更新 Xray 核心          2. 创建 Reality 节点\n'
         printf ' 3. 批量创建 Reality 节点        4. 查看节点列表\n'

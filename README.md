@@ -66,7 +66,7 @@ yum install -y curl wget
 - **流量统计**：通过 Xray Stats API 按节点统计上下行流量，重启不丢量，支持本月与历史月份。
 - **月流量限额**：按 GB 设置每月额度，超限自动封禁对应端口，次月自动恢复。
 - **到期时间**：按剩余天数或指定日期限制节点有效期，到期自动封禁。
-- **端口限速**：按节点端口限制 Mbps，同时作用于上传和下载方向。
+- **端口限速**：使用 tc `clsact` police 规则按节点端口限制上传和下载，不接管 root qdisc。
 - **自动封禁**：使用 nftables 独立表阻断超限端口，失败时回退 iptables。
 - **实时监控**：终端内查看每个节点的实时上下行速率。
 - **链接管理**：查看 VLESS 分享链接、终端二维码，导出全部链接和 Base64 订阅。
@@ -77,7 +77,7 @@ yum install -y curl wget
 - **Alpine Linux v3.21**（其他使用 OpenRC + apk 的 Alpine 版本通常也可以）
 - root 权限
 - 能访问 GitHub（用于下载 Xray）；网络受限时可在 rysh「全局设置」中配置下载代理
-- 建议使用官方 Alpine 内核，确保支持 `nftables`、`tc`、`htb`、`ifb`、`cls_flower`
+- 建议使用官方 Alpine 内核，确保支持 `nftables`、tc `clsact`、`flower` 和 police action
 
 脚本会自动安装：
 
@@ -143,7 +143,7 @@ cron 任务默认每分钟执行一次：
 * * * * * /usr/local/bin/rysh monitor --quiet
 ```
 
-每次执行通过 `xray api statsquery -reset` 取得自上次检查以来的流量增量，再累加到状态文件中。这样即使 Xray 重启，累计流量也不会重复计算。
+每次执行读取 Xray 的累计用户计数，并与状态文件保存的上次计数作差后累加。状态文件同时保存 Xray 进程代次；检测到进程重启时，以新进程计数作为新增流量，不再通过 `-reset` 清空 Xray 计数器。若一次监控在保存状态前异常退出，下次轮询仍可从未清零的累计值恢复。
 
 查看方式：
 
@@ -175,16 +175,17 @@ cron 任务默认每分钟执行一次：
 
 ## 端口限速
 
-菜单 `13` 设置节点限速，单位 Mbps，`0` 表示不限。限速作用于该节点的监听端口：
+菜单 `13` 设置节点限速，单位 Mbps，`0` 表示不限。限速作用于该节点的监听端口，使用 tc `clsact` 上的 police 规则：
 
-- 下载方向（服务器 → 客户端）：按源端口匹配，使用 egress HTB
-- 上传方向（客户端 → 服务器）：通过 ifb 重定向后按目标端口匹配，使用 ingress HTB
-- 优先使用 `flower` 过滤器，同时匹配 IPv4 / IPv6；内核不支持时回退到 IPv4 的 `u32`
+- 下载方向（服务器 → 客户端）：按 TCP 源端口匹配
+- 上传方向（客户端 → 服务器）：按 TCP 目标端口匹配
+- 优先使用 `flower` 匹配 IPv4 / IPv6；内核不支持时回退到 IPv4 `u32`
 
 注意：
 
-- 脚本会重建默认网卡的 root qdisc。**如果服务器上还有其他 tc 限速规则，请先备份或不要使用本功能。**
-- 上传方向限速需要内核支持 `ifb` 模块；没有该模块时只对下载方向生效。
+- 脚本只添加和删除自己记录的 `clsact` 过滤规则，不删除网卡原有 root qdisc，也不重定向全网卡流量。
+- police 是超速丢包式限速，不是平滑排队；TCP 通常会因重传降低吞吐。实际速率受内核、线路和短时突发影响。
+- 需要内核支持 `clsact`、`flower`（建议）和 police action；规则不支持时会报错，不会改动 root qdisc。
 - 限速规则由 OpenRC 服务 `rysh` 在开机时自动恢复，也可以在菜单 `16` 手动重新应用。
 
 ## 自动封禁
@@ -310,12 +311,11 @@ A: 检查 `tc` 与内核模块：
 
 ```sh
 command -v tc
-tc qdisc show
-tc class show dev <网卡>
-lsmod | grep -E 'ifb|htb|cls_flower'
+tc qdisc show dev <网卡>
+tc filter show dev <网卡> egress chain 1381589832
 ```
 
-缺少模块时可尝试 `modprobe ifb`、`modprobe sch_htb`、`modprobe cls_flower`。容器或精简内核可能无法使用 ingress 限速，此时只有下载方向生效。
+容器或精简内核可能缺少 `clsact`、`flower` 或 police action 支持。脚本会保留现有 qdisc，并提示无法创建的规则；确认内核支持后可重新执行菜单 `16`。
 
 **Q: 到期或超流量没有封禁？**
 
