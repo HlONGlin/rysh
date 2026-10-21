@@ -180,18 +180,18 @@ remove_shortcut() {
 
 ensure_deps() {
     missing=""
-    for c in curl unzip jq nft tc ss; do
+    for c in curl unzip jq nft tc ss openssl timeout; do
         need_cmd "$c" || missing="$missing $c"
     done
     if [ -n "$missing" ]; then
         msg "正在安装依赖:$missing"
         if need_cmd apk; then
-            apk add --no-cache curl unzip jq nftables iptables iproute2 ca-certificates >/dev/null 2>&1 || return 1
+            apk add --no-cache curl unzip jq nftables iptables iproute2 ca-certificates openssl coreutils >/dev/null 2>&1 || return 1
             need_cmd tc || apk add --no-cache iproute2-tc >/dev/null 2>&1 || true
             need_cmd ss || apk add --no-cache iproute2-ss >/dev/null 2>&1 || true
         elif need_cmd apt-get; then
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl unzip jq nftables iptables iproute2 ca-certificates cron >/dev/null 2>&1 || {
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl unzip jq nftables iptables iproute2 ca-certificates cron openssl coreutils >/dev/null 2>&1 || {
                 err "依赖安装失败，请检查网络或软件源"
                 return 1
             }
@@ -1567,6 +1567,7 @@ new_node_record() {
 
 create_node() {
     require_xray
+    prepare_node_sni
     id=$(next_id)
     name="节点$id"
     prompt_default "节点名称" "$name"
@@ -1648,6 +1649,7 @@ create_node() {
 
 batch_create() {
     require_xray
+    prepare_node_sni
     prompt_default "创建数量" "3"
     count=$(sanitize_text "$REPLY")
     while ! is_uint "$count" || [ "$(to_int "$count")" -lt 1 ] || [ "$(to_int "$count")" -gt 100 ]; do
@@ -2549,7 +2551,7 @@ system_info() {
     printf '监控任务 : %s\n' "$cron_count"
     printf '磁盘 /   : %s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
     printf '\n%s依赖检查%s\n\n' "$C_BOLD" "$C_NC"
-    for c in curl wget unzip jq nft tc ss iptables qrencode; do
+    for c in curl wget unzip jq nft tc ss iptables qrencode openssl timeout; do
         if need_cmd "$c"; then
             printf '  %s[OK]%s %s\n' "$C_GREEN" "$C_NC" "$c"
         else
@@ -2583,6 +2585,142 @@ test_nodes() {
         fi
         printf '[%s] %s 端口 %s | 状态 %s | %s | %s\n' "$id" "$N_NAME" "$N_PORT" "$(node_status)" "$local_status" "$ext_status"
     done
+}
+
+SNI_DATA_DIR="/usr/local/share/rysh"
+
+sni_host_region() {
+    awk -F '\t' -v host="$1" '$1==host {print $3; exit}' "$SNI_DATA_DIR/sni-candidates.tsv" 2>/dev/null
+}
+
+sni_host_risk() {
+    host=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+    awk -v host="$host" 'host==$0 || (length(host)>length($0) && substr(host, length(host)-length($0), 1)=="." && substr(host, length(host)-length($0)+1)==$0) {found=1; exit} END{exit !found}' "$SNI_DATA_DIR/sni-risk-suffixes.txt" 2>/dev/null
+}
+
+sni_category_hosts() {
+    awk -F '\t' -v category="$1" '$2==category {print $1}' "$SNI_DATA_DIR/sni-candidates.tsv"
+}
+
+sni_region_hosts() {
+    region="$1"
+    awk -F '\t' -v region="$region" '$3=="global" || $3==region {print $1}' "$SNI_DATA_DIR/sni-candidates.tsv"
+}
+
+quick_sni_detect() {
+    SNI_DETECTED=""
+    [ -f "$SNI_DATA_DIR/sni-candidates.tsv" ] || return 1
+    need_cmd openssl && need_cmd curl && need_cmd timeout || return 1
+    candidates=$(awk -F '\t' '$2=="cdn" {print $1}' "$SNI_DATA_DIR/sni-candidates.tsv" | awk 'NR<=3')
+    best_time=""
+    for host in $candidates; do
+        if sni_host_risk "$host"; then continue; fi
+        result=$(timeout 6 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -verify_return_error -verify_hostname "$host" -brief </dev/null 2>&1)
+        printf '%s\n' "$result" | grep -qiE 'Protocol version: TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' || continue
+        printf '%s\n' "$result" | grep -qiE 'Negotiated ALPN protocol: h2|ALPN protocol: h2' || continue
+        printf '%s\n' "$result" | grep -qiE 'Verification: OK|Verify return code: 0 \(ok\)' || continue
+        printf '%s\n' "$result" | grep -qi 'X25519' || continue
+        timing=$(curl -sS -o /dev/null --http1.1 --connect-timeout 4 --max-time 6 -w '%{time_appconnect}' "https://$host/" 2>/dev/null)
+        case "$timing" in ''|*[!0-9.]*) continue ;; esac
+        if [ -z "$best_time" ] || awk -v a="$timing" -v b="$best_time" 'BEGIN{exit !(a<b)}'; then
+            best_time="$timing"
+            SNI_DETECTED="$host"
+        fi
+    done
+    [ -n "$SNI_DETECTED" ]
+}
+
+prepare_node_sni() {
+    if quick_sni_detect; then
+        DEFAULT_SNI="$SNI_DETECTED"
+        printf '快速识别结果: %s (作为默认 SNI/目标地址，可手动修改)\n' "$SNI_DETECTED"
+    else
+        printf '快速识别未找到合规候选，继续使用当前默认值: %s\n' "$DEFAULT_SNI"
+    fi
+}
+
+check_sni_candidates() {
+    require_root
+    [ -f "$SNI_DATA_DIR/sni-candidates.tsv" ] && [ -f "$SNI_DATA_DIR/sni-risk-suffixes.txt" ] || {
+        err "SNI 检测数据文件缺失，请重新安装 rysh"
+        return 1
+    }
+    printf 'SNI 检测: 1.快速测试  2.全部分类  3.选择分类  4.按地区推荐  5.自定义域名\n请选择: '
+    read -r mode 2>/dev/null || mode=""
+    case "$mode" in
+        1) candidates=$(awk -F '\t' '$2=="cdn" || $2=="cloud" || $2=="tech" {print $1}' "$SNI_DATA_DIR/sni-candidates.tsv") ;;
+        2) candidates=$(awk -F '\t' '{print $1}' "$SNI_DATA_DIR/sni-candidates.tsv") ;;
+        3)
+            printf '分类: cdn cloud tech fin edu media social gaming ecom region\n选择一个或多个分类(空格分隔): '
+            read -r selected 2>/dev/null || selected=""
+            candidates=""
+            for category in $selected; do
+                case "$category" in cdn|cloud|tech|fin|edu|media|social|gaming|ecom|region) candidates="$candidates $(sni_category_hosts "$category")" ;; esac
+            done
+            ;;
+        4)
+            printf '地区: global us eu jp hk sg cn au kr\n请选择地区: '
+            read -r region 2>/dev/null || region=""
+            case "$region" in global|us|eu|jp|hk|sg|cn|au|kr) candidates=$(sni_region_hosts "$region") ;; *) warn "地区无效"; return 1 ;; esac
+            ;;
+        5)
+            printf '输入域名(空格或逗号分隔): '
+            read -r candidates 2>/dev/null || candidates=""
+            candidates=$(printf '%s' "$candidates" | tr ',' ' ')
+            ;;
+        *) warn "无效选项"; return 1 ;;
+    esac
+    [ -n "$candidates" ] || { warn "没有可检测的域名"; return 1; }
+    if ! need_cmd openssl || ! need_cmd curl; then
+        err "检测需要 curl 和 openssl，请先安装"
+        return 1
+    fi
+    printf '\n%-34s %-9s %-7s %-5s %-10s %-8s %-9s %s\n' '域名' '握手秒' 'TLS1.3' 'h2' '密钥交换' '证书' '地区' '结果'
+    printf '%s\n' '----------------------------------------------------------------------------------------------------------'
+    best_host=""
+    best_time=""
+    for host in $candidates; do
+        validate_sni "$host" || {
+            printf '%-34s %s\n' "$host" '跳过: 域名格式无效'
+            continue
+        }
+        info=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -brief </dev/null 2>&1)
+        tls="否"
+        alpn="否"
+        key="未知"
+        cert="否"
+        printf '%s\n' "$info" | grep -qiE 'Protocol version: TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' && tls="是"
+        printf '%s\n' "$info" | grep -qi 'Negotiated ALPN protocol: h2' && alpn="是"
+        key=$(printf '%s\n' "$info" | awk -F': ' 'tolower($1) ~ /peer.*temp.*key/ {print $2; exit}')
+        [ -n "$key" ] || key="未知"
+        verify=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -verify_return_error -verify_hostname "$host" -brief </dev/null 2>&1)
+        printf '%s\n' "$verify" | grep -qiE 'Verification: OK|Verify return code: 0 \(ok\)' && cert="是"
+        timing=$(curl -sS -o /dev/null --http1.1 --connect-timeout 5 --max-time 8 -w '%{time_appconnect}' "https://$host/" 2>/dev/null)
+        case "$timing" in ''|*[!0-9.]*) timing="超时" ;; esac
+        region=$(sni_host_region "$host")
+        [ -n "$region" ] || region="自定义"
+        result="不合规"
+        risk="否"
+        if sni_host_risk "$host"; then risk="是"; fi
+        if [ "$risk" = "是" ]; then
+            result="风险后缀"
+        elif [ "$tls" = "是" ] && [ "$alpn" = "是" ] && [ "$cert" = "是" ] && printf '%s' "$key" | grep -qi 'X25519'; then
+            result="推荐"
+            if [ "$timing" != "超时" ] && { [ -z "$best_time" ] || awk -v a="$timing" -v b="$best_time" 'BEGIN{exit !(a<b)}'; }; then
+                best_time="$timing"
+                best_host="$host"
+            fi
+        elif [ "$tls" = "是" ] && [ "$cert" = "是" ]; then
+            result="可用性待確認"
+        fi
+        printf '%-34s %-9s %-7s %-5s %-10s %-8s %-9s %s\n' "$host" "$timing" "$tls" "$alpn" "$key" "$cert" "$region" "$result"
+    done
+    if [ -n "$best_host" ]; then
+        printf '\n建议 dest/SNI: %s:443 (握手 %ss)\n' "$best_host" "$best_time"
+        printf '提示：添加节点时将 SNI 与目标地址主机名设为同一域名。\n'
+    else
+        warn "没有检测到全部满足 TLS1.3、h2、X25519 和证书校验的候选站点"
+    fi
 }
 
 service_start() {
@@ -2708,6 +2846,8 @@ uninstall_keep_config() {
     clear_all
     remove_shortcut
     rm -f /etc/init.d/rysh /usr/local/bin/rysh
+    rm -f "$SNI_DATA_DIR/sni-candidates.tsv" "$SNI_DATA_DIR/sni-risk-suffixes.txt"
+    rmdir "$SNI_DATA_DIR" 2>/dev/null || true
     ok "rysh 已卸载，配置保留在 $RYSH_DIR"
 }
 
@@ -2727,7 +2867,7 @@ purge_all() {
     clear_all
     remove_shortcut
     rm -f /etc/init.d/xray /etc/init.d/rysh /usr/local/bin/xray /usr/local/bin/xray.bak /usr/local/bin/rysh
-    rm -rf "$RYSH_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR"
+    rm -rf "$RYSH_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR" "$SNI_DATA_DIR"
     ok "完全卸载完成"
 }
 
@@ -2818,7 +2958,8 @@ main_menu() {
         printf '19. 安装/更新监控定时任务      20. 全局设置\n'
         printf '21. 备份/恢复                  22. 系统信息/依赖检查\n'
         printf '23. 卸载                       24. 编辑 Xray 配置\n'
-        printf '25. 测试节点连通性              0. 退出\n'
+        printf '25. 测试节点连通性             26. Reality SNI 检测\n'
+        printf '                                   0. 退出\n'
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
         is_uint "$choice" && choice=$(to_int "$choice")
@@ -2848,6 +2989,7 @@ main_menu() {
             23) uninstall_menu ;;
             24) edit_config; pause ;;
             25) test_nodes; pause ;;
+            26) check_sni_candidates; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac

@@ -5,6 +5,7 @@ REPO_RAW="${RYSH_REPO_RAW:-https://github.com/HlONGlin/rysh/raw/main}"
 RYSH_BIN="/usr/local/bin/rysh"
 RYSH_SRC_URL="$REPO_RAW/rysh.sh"
 TMP_FILE="/tmp/rysh-install.$$"
+DATA_DIR="/usr/local/share/rysh"
 
 if [ -t 1 ]; then
     C_RED=$(printf '\033[31m')
@@ -49,6 +50,7 @@ need_cmd() {
 
 cleanup() {
     rm -f "$TMP_FILE" 2>/dev/null
+    rm -rf "$TMP_FILE.data" 2>/dev/null
 }
 trap 'cleanup' EXIT INT TERM
 
@@ -110,6 +112,13 @@ install_rysh() {
         rm -f "$TMP_FILE"
         die "下载内容无效，请稍后重试"
     fi
+    mkdir -p "$TMP_FILE.data" || die "无法创建临时数据目录"
+    for data_file in sni-candidates.tsv sni-risk-suffixes.txt; do
+        if ! download "$REPO_RAW/$data_file" "$TMP_FILE.data/$data_file"; then
+            rm -rf "$TMP_FILE.data" "$TMP_FILE"
+            die "下载 SNI 检测数据失败: $data_file"
+        fi
+    done
     chmod 755 "$TMP_FILE"
     mkdir -p /usr/local/bin 2>/dev/null
     if ! mv "$TMP_FILE" "$RYSH_BIN"; then
@@ -117,6 +126,10 @@ install_rysh() {
         die "安装到 $RYSH_BIN 失败"
     fi
     chmod 755 "$RYSH_BIN"
+    mkdir -p "$DATA_DIR" || die "无法创建 $DATA_DIR"
+    cp "$TMP_FILE.data/sni-candidates.tsv" "$DATA_DIR/sni-candidates.tsv" && cp "$TMP_FILE.data/sni-risk-suffixes.txt" "$DATA_DIR/sni-risk-suffixes.txt" || die "安装 SNI 检测数据失败"
+    chmod 644 "$DATA_DIR"/*
+    rm -rf "$TMP_FILE.data"
     ok "rysh 已安装到 $RYSH_BIN"
 
     ensure_shortcut

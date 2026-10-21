@@ -99,6 +99,8 @@ iproute2-tc iproute2-ss qrencode
 4. 创建完成后终端会输出 VLESS 分享链接，导入客户端即可使用。
 5. 需要二维码时，在节点管理菜单选择 `5`；需要导出全部链接时选择 `6`。
 
+创建单个或批量节点时，rysh 会先对 CDN 分类中的前三个候选执行快速 Reality 条件检测，并把合规且握手较快的域名作为默认 SNI/目标地址；检测失败时继续使用全局默认值，仍可在交互提示中修改。
+
 创建节点的默认参数：
 
 | 项目 | 默认值 |
@@ -128,8 +130,11 @@ Reality 的目标站点需要支持 TLS 1.3 和 HTTP/2，并且能从你的服�
 19. 安装/更新监控定时任务      20. 全局设置
 21. 备份/恢复                  22. 系统信息/依赖检查
 23. 卸载                       24. 编辑 Xray 配置
-25. 测试节点连通性              0. 退出
+25. 测试节点连通性             26. Reality SNI 检测
+                                   0. 退出
 ```
+
+菜单 `26` 提供快速测试、全部分类、指定分类、按地区推荐和自定义域名检测。内置 98 个候选站点，地区包括 global、美国/北美、欧洲、日本、香港、新加坡/东南亚、中国大陆、澳洲和韩国；地区检测自动包含对应站点与 global 候选。检查项包括 TLS 1.3、ALPN h2、X25519、证书主机名校验和 TLS 握手耗时；命中随项目分发的 GFWList 域名后缀库时会标记风险并排除推荐。检测结果只反映当时从本机到目标站的连通情况；Reality 节点的 SNI 与目标地址主机名应保持一致。
 
 「修改节点」支持修改名称、端口、SNI / 目标地址、流控、指纹、UUID、Reality 密钥和备注。重置 UUID 或密钥后旧链接立即失效；修改端口、SNI、流控、UUID 或密钥后，脚本会自动重新生成配置并重启 Xray。
 
@@ -242,6 +247,8 @@ rysh version                显示脚本版本
 /usr/local/bin/xray                    Xray 可执行文件
 /usr/local/etc/xray/config.json        Xray 配置（由脚本生成）
 /usr/local/share/xray/                 geoip.dat / geosite.dat
+/usr/local/share/rysh/sni-candidates.tsv SNI 分类与地区候选库
+/usr/local/share/rysh/sni-risk-suffixes.txt SNI 风险后缀库
 /var/log/xray/error.log                Xray 错误日志
 /etc/rysh/nodes/<节点ID>.conf          节点配置（含私钥，权限 600）
 /etc/rysh/state/<节点ID>.state         节点流量状态
