@@ -20,7 +20,7 @@ bash <(curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh)
 
 如果想完全清除后重新开始，在一键管理工具中选择 `4`，并输入 `DELETE` 确认。该操作会删除 rysh、Xray、全部节点配置、流量记录、限速与防火墙规则；清除后重新选择 `1` 安装即可。
 
-脚本会从本项目 `main` 分支下载 `rysh.sh`，安装到 `/usr/local/bin/rysh`，并自动完成依赖安装、Xray 核心安装、OpenRC 服务注册和 cron 监控任务创建。安装完成后选择 `6` 进入节点管理菜单，即可创建第一个 Reality 节点。
+脚本会从本项目 `main` 分支下载 `rysh.sh`，安装到 `/usr/local/bin/rysh`，并自动完成依赖安装、Xray 核心安装、系统服务注册和 cron 监控任务创建。Alpine 使用 OpenRC，Debian 使用 systemd。安装完成后选择 `6` 进入节点管理菜单，即可创建第一个 Reality 节点。
 
 部署完成后，在任意目录输入 **`ry`** 即可直接唤出面板（脚本会自动创建 `/usr/local/bin/ry` 快捷命令，等价于 `rysh`）：
 
@@ -60,7 +60,7 @@ yum install -y curl wget
 
 ## 特性
 
-- **一键部署**：自动安装依赖、Xray 核心、OpenRC 服务与监控任务。
+- **一键部署**：自动安装依赖、Xray 核心、OpenRC/systemd 服务与监控任务。
 - **多节点**：单机创建任意数量的 VLESS Reality 节点，每个节点独立端口、UUID、Reality 密钥、ShortID、SNI 和目标地址。
 - **批量创建**：一次生成多个节点，自动分配空闲端口，统一设置 SNI、限额、到期和限速。
 - **流量统计**：通过 Xray Stats API 按节点统计上下行流量，重启不丢量，支持本月与历史月份。
@@ -74,12 +74,12 @@ yum install -y curl wget
 
 ## 系统要求
 
-- **Alpine Linux v3.21**（其他使用 OpenRC + apk 的 Alpine 版本通常也可以）
+- **Alpine Linux v3.21**（OpenRC）或 **Debian 11/12**（systemd）
 - root 权限
 - 能访问 GitHub（用于下载 Xray）；网络受限时可在 rysh「全局设置」中配置下载代理
 - 建议使用官方 Alpine 内核，确保支持 `nftables`、tc `clsact`、`flower` 和 police action
 
-脚本会自动安装：
+脚本会自动安装所需依赖（Alpine 使用 `apk`，Debian 使用 `apt-get`）：
 
 ```text
 curl unzip jq nftables iptables iproute2 ca-certificates
@@ -186,7 +186,7 @@ cron 任务默认每分钟执行一次：
 - 脚本只添加和删除自己记录的 `clsact` 过滤规则，不删除网卡原有 root qdisc，也不重定向全网卡流量。
 - police 是超速丢包式限速，不是平滑排队；TCP 通常会因重传降低吞吐。实际速率受内核、线路和短时突发影响。
 - 需要内核支持 `clsact`、`flower`（建议）和 police action；规则不支持时会报错，不会改动 root qdisc。
-- 限速规则由 OpenRC 服务 `rysh` 在开机时自动恢复，也可以在菜单 `16` 手动重新应用。
+- 限速规则由系统服务 `rysh` 在开机时自动恢复，也可以在菜单 `16` 手动重新应用。
 
 ## 自动封禁
 
@@ -235,8 +235,10 @@ rysh version                显示脚本版本
 ```text
 /usr/local/bin/rysh                    主脚本
 /usr/local/bin/ry                      rysh 快捷命令（指向 rysh 的软链接）
-/etc/init.d/rysh                       OpenRC 策略服务（开机应用限速/防火墙）
-/etc/init.d/xray                       OpenRC Xray 服务
+/etc/init.d/rysh                       OpenRC 策略服务（Alpine）
+/etc/init.d/xray                       OpenRC Xray 服务（Alpine）
+/etc/systemd/system/rysh.service       systemd 策略服务（Debian）
+/etc/systemd/system/xray.service       systemd Xray 服务（Debian）
 /usr/local/bin/xray                    Xray 可执行文件
 /usr/local/etc/xray/config.json        Xray 配置（由脚本生成）
 /usr/local/share/xray/                 geoip.dat / geosite.dat
@@ -247,7 +249,7 @@ rysh version                显示脚本版本
 /etc/rysh/settings.conf                全局设置
 /etc/rysh/events.log                   封禁/解封事件
 /etc/rysh/blocked.ports                当前被封禁的端口
-/etc/crontabs/root                     cron 监控任务
+/etc/crontabs/root 或 root crontab     cron 监控任务
 ```
 
 备份菜单 `21` 会把上述关键文件打包到 `/root/rysh-backup-<时间>.tar.gz`，恢复时从同一菜单选择备份文件即可。

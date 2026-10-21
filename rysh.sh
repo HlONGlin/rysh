@@ -179,22 +179,26 @@ remove_shortcut() {
 }
 
 ensure_deps() {
-    if ! need_cmd apk; then
-        warn "未找到 apk，这可能不是 Alpine Linux"
-        return 0
-    fi
     missing=""
     for c in curl unzip jq nft tc ss; do
         need_cmd "$c" || missing="$missing $c"
     done
     if [ -n "$missing" ]; then
         msg "正在安装依赖:$missing"
-        apk add --no-cache curl unzip jq nftables iptables iproute2 ca-certificates >/dev/null 2>&1 || {
+        if need_cmd apk; then
+            apk add --no-cache curl unzip jq nftables iptables iproute2 ca-certificates >/dev/null 2>&1 || return 1
+            need_cmd tc || apk add --no-cache iproute2-tc >/dev/null 2>&1 || true
+            need_cmd ss || apk add --no-cache iproute2-ss >/dev/null 2>&1 || true
+        elif need_cmd apt-get; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl unzip jq nftables iptables iproute2 ca-certificates cron >/dev/null 2>&1 || {
+                err "依赖安装失败，请检查网络或软件源"
+                return 1
+            }
+        else
             err "依赖安装失败，请检查网络或软件源"
             return 1
-        }
-        need_cmd tc || apk add --no-cache iproute2-tc >/dev/null 2>&1 || true
-        need_cmd ss || apk add --no-cache iproute2-ss >/dev/null 2>&1 || true
+        fi
     fi
     need_cmd jq || warn "jq 未安装，流量统计可能不可用"
     return 0
@@ -267,6 +271,10 @@ SERVICE_EOF
 
 openrc_active() {
     [ -d /run/openrc ] && need_cmd rc-service
+}
+
+systemd_active() {
+    need_cmd systemctl && [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]
 }
 
 install_xray() {
@@ -369,6 +377,10 @@ install_xray() {
     if openrc_active; then
         rc-update add xray default >/dev/null 2>&1 || true
         rc-update add rysh default >/dev/null 2>&1 || true
+    elif systemd_active; then
+        create_systemd_services
+        systemctl daemon-reload
+        systemctl enable rysh.service xray.service >/dev/null 2>&1 || true
     fi
     xray_start
     if ! wait_xray_start; then
@@ -378,6 +390,39 @@ install_xray() {
     install_cron
     [ -n "$(node_ids)" ] && apply_tc_all
     ok "Xray 安装完成: $("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+}
+
+create_systemd_services() {
+    cat > /etc/systemd/system/xray.service <<'SERVICE_EOF'
+[Unit]
+Description=Xray-core service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+    cat > /etc/systemd/system/rysh.service <<'SERVICE_EOF'
+[Unit]
+Description=rysh network policy
+After=network-online.target
+Before=xray.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rysh apply --quiet
+ExecStop=/usr/local/bin/rysh clear --quiet
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
 }
 
 validate_config() {
@@ -395,6 +440,10 @@ validate_config_verbose() {
 }
 
 xray_start() {
+    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
+        systemctl start xray.service >/dev/null 2>&1 || true
+        return 0
+    fi
     if openrc_active && [ -x /etc/init.d/xray ]; then
         rc-service xray start >/dev/null 2>&1 || true
         return 0
@@ -408,6 +457,10 @@ xray_start() {
 }
 
 xray_stop() {
+    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
+        systemctl stop xray.service >/dev/null 2>&1 || true
+        return 0
+    fi
     if openrc_active && [ -x /etc/init.d/xray ]; then
         rc-service xray stop >/dev/null 2>&1 || true
         return 0
@@ -425,6 +478,10 @@ xray_restart() {
 }
 
 xray_running() {
+    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
+        systemctl is-active --quiet xray.service
+        return $?
+    fi
     if openrc_active && [ -x /etc/init.d/xray ]; then
         rc-service xray status >/dev/null 2>&1
         return $?
@@ -1747,8 +1804,15 @@ show_link_menu() {
         read -r ans 2>/dev/null || ans=""
         case "$ans" in
             y|Y)
-                if need_cmd apk; then
-                    apk add --no-cache qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$link" 2>/dev/null || warn "二维码安装或生成失败"
+                if ! need_cmd qrencode && need_cmd apk; then
+                    apk add --no-cache qrencode >/dev/null 2>&1 || warn "二维码安装失败"
+                elif ! need_cmd qrencode && need_cmd apt-get; then
+                    apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "二维码安装失败"
+                fi
+                if need_cmd qrencode; then
+                    qrencode -t ANSIUTF8 "$link" 2>/dev/null || warn "二维码生成失败"
+                else
+                    warn "请手动安装 qrencode 后重试"
                 fi
                 ;;
         esac
@@ -2258,6 +2322,8 @@ xray_status_log() {
     printf '运行状态: %s\n' "$(xray_status_text)"
     if openrc_active; then
         printf '服务状态: %s\n' "$(rc-service xray status 2>&1 | head -n 1)"
+    elif systemd_active; then
+        printf '服务状态: %s\n' "$(systemctl is-active xray.service 2>/dev/null || true)"
     fi
     printf '\n%s最近错误日志%s\n' "$C_BOLD" "$C_NC"
     tail -n 30 "$XRAY_LOG_DIR/error.log" 2>/dev/null || printf '暂无日志\n'
@@ -2267,6 +2333,15 @@ xray_status_log() {
 
 install_cron() {
     [ -n "$MONITOR_INTERVAL" ] || MONITOR_INTERVAL="1"
+    if systemd_active; then
+        current=$(crontab -l 2>/dev/null || true)
+        updated=$(printf '%s\n' "$current" | grep -v 'rysh monitor' || true)
+        updated=$(printf '%s\n%s' "$updated" "*/$MONITOR_INTERVAL * * * * /usr/local/bin/rysh monitor --quiet >/dev/null 2>&1")
+        printf '%s\n' "$updated" | crontab -
+        systemctl enable --now cron.service >/dev/null 2>&1 || systemctl enable --now crond.service >/dev/null 2>&1 || true
+        ok "监控定时任务已安装 (每 $MONITOR_INTERVAL 分钟)"
+        return 0
+    fi
     [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
     touch /etc/crontabs/root
     self_install
@@ -2283,6 +2358,10 @@ install_cron() {
 }
 
 remove_cron() {
+    if systemd_active; then
+        crontab -l 2>/dev/null | grep -v 'rysh monitor' | crontab - 2>/dev/null || true
+        return 0
+    fi
     [ -f /etc/crontabs/root ] || return 0
     tmp=$(mktemp 2>/dev/null) || tmp="/etc/crontabs/root.tmp.$$"
     grep -v 'rysh monitor' /etc/crontabs/root > "$tmp" 2>/dev/null || true
@@ -2461,7 +2540,11 @@ system_info() {
     fi
     printf 'Xray状态 : %s\n' "$(xray_status_text)"
     printf '节点数量 : %s\n' "$(node_ids | wc -l | tr -d ' ')"
-    cron_count=$(grep -c 'rysh monitor' /etc/crontabs/root 2>/dev/null)
+    if systemd_active; then
+        cron_count=$(crontab -l 2>/dev/null | grep -c 'rysh monitor')
+    else
+        cron_count=$(grep -c 'rysh monitor' /etc/crontabs/root 2>/dev/null)
+    fi
     [ -n "$cron_count" ] || cron_count=0
     printf '监控任务 : %s\n' "$cron_count"
     printf '磁盘 /   : %s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
@@ -2503,6 +2586,11 @@ test_nodes() {
 }
 
 service_start() {
+    if systemd_active; then
+        systemctl start rysh.service xray.service
+        wait_xray_start
+        return $?
+    fi
     if openrc_active; then
         rc-service rysh start >/dev/null 2>&1 || true
         rc-service xray start >/dev/null 2>&1 || true
@@ -2516,6 +2604,10 @@ service_start() {
 }
 
 service_stop() {
+    if systemd_active; then
+        systemctl stop xray.service rysh.service >/dev/null 2>&1 || true
+        return 0
+    fi
     if openrc_active; then
         rc-service xray stop >/dev/null 2>&1 || true
         rc-service rysh stop >/dev/null 2>&1 || true
@@ -2527,6 +2619,11 @@ service_stop() {
 
 service_status() {
     printf 'Xray  : %s\n' "$(xray_status_text)"
+    if systemd_active; then
+        printf 'rysh  : %s\n' "$(systemctl is-active rysh.service 2>/dev/null || true)"
+        printf 'cron  : %s\n' "$(systemctl is-active cron.service 2>/dev/null || systemctl is-active crond.service 2>/dev/null || true)"
+        return 0
+    fi
     if openrc_active; then
         printf 'rysh  : %s\n' "$(rc-service rysh status 2>&1 | head -n 1)"
         printf 'crond : %s\n' "$(rc-service crond status 2>&1 | head -n 1)"
@@ -2603,6 +2700,11 @@ uninstall_keep_config() {
         rc-service rysh stop >/dev/null 2>&1 || true
         rc-update del rysh default >/dev/null 2>&1 || true
     fi
+    if systemd_active; then
+        systemctl disable --now rysh.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/rysh.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
     clear_all
     remove_shortcut
     rm -f /etc/init.d/rysh /usr/local/bin/rysh
@@ -2616,6 +2718,11 @@ purge_all() {
         rc-update del xray default >/dev/null 2>&1 || true
         rc-update del rysh default >/dev/null 2>&1 || true
         rc-service rysh stop >/dev/null 2>&1 || true
+    fi
+    if systemd_active; then
+        systemctl disable --now xray.service rysh.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/xray.service /etc/systemd/system/rysh.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
     fi
     clear_all
     remove_shortcut
