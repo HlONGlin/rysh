@@ -322,25 +322,36 @@ install_xray() {
         die "压缩包中未找到 xray 可执行文件"
     }
 
+    candidate="$XRAY_BIN.new.$$"
+    if ! cp "$tmp/xray" "$candidate" || ! chmod 755 "$candidate"; then
+        rm -f "$candidate"
+        rm -rf "$tmp"
+        die "准备新版本 Xray 失败"
+    fi
     if [ -x "$XRAY_BIN" ]; then
         cp "$XRAY_BIN" "$XRAY_BIN.bak" 2>/dev/null || true
     fi
     xray_stop
-    sleep 1
-    if ! cp "$tmp/xray" "$XRAY_BIN"; then
+    if ! mv -f "$candidate" "$XRAY_BIN"; then
+        rm -f "$candidate"
         [ -x "$XRAY_BIN.bak" ] && mv "$XRAY_BIN.bak" "$XRAY_BIN"
         xray_start
         rm -rf "$tmp"
         die "安装 xray 失败"
     fi
-    chmod 755 "$XRAY_BIN"
     [ -f "$tmp/geoip.dat" ] && cp "$tmp/geoip.dat" "$XRAY_ASSET_DIR/geoip.dat"
     [ -f "$tmp/geosite.dat" ] && cp "$tmp/geosite.dat" "$XRAY_ASSET_DIR/geosite.dat"
     rm -rf "$tmp"
 
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         if [ -x "$XRAY_BIN.bak" ]; then
-            mv "$XRAY_BIN.bak" "$XRAY_BIN"
+            restore="$XRAY_BIN.restore.$$"
+            if cp "$XRAY_BIN.bak" "$restore" && chmod 755 "$restore"; then
+                mv -f "$restore" "$XRAY_BIN"
+            else
+                rm -f "$restore"
+                err "恢复旧版 Xray 失败，备份仍保留在 $XRAY_BIN.bak"
+            fi
             xray_start
         fi
         die "Xray 无法运行，可能是架构不匹配"
