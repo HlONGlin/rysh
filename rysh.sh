@@ -575,6 +575,7 @@ load_node() {
     N_ID=""
     N_NAME=""
     N_PORT=""
+    N_PUBLIC_PORT=""
     N_UUID=""
     N_PRIV=""
     N_PUB=""
@@ -594,6 +595,7 @@ load_node() {
     . "$f"
     N_ID=${N_ID:-$1}
     N_NAME=${N_NAME:-节点$N_ID}
+    N_PUBLIC_PORT=${N_PUBLIC_PORT:-$N_PORT}
     N_ENABLED=${N_ENABLED:-1}
     N_EXPIRES=${N_EXPIRES:-0}
     N_QUOTA_GB=${N_QUOTA_GB:-0}
@@ -610,6 +612,7 @@ save_node() {
         printf "N_ID='%s'\n" "$N_ID"
         printf "N_NAME='%s'\n" "$(sanitize_text "$N_NAME")"
         printf "N_PORT='%s'\n" "$N_PORT"
+        printf "N_PUBLIC_PORT='%s'\n" "${N_PUBLIC_PORT:-$N_PORT}"
         printf "N_UUID='%s'\n" "$N_UUID"
         printf "N_PRIV='%s'\n" "$N_PRIV"
         printf "N_PUB='%s'\n" "$N_PUB"
@@ -865,13 +868,14 @@ urlencode() {
 
 build_link() {
     ip="${CACHED_IP:-$(get_public_ip)}"
+    public_port="${N_PUBLIC_PORT:-$N_PORT}"
     enc=$(urlencode "$N_NAME")
     flow=""
     [ -n "$N_FLOW" ] && flow="&flow=$N_FLOW"
     fp="$N_FP"
     [ -n "$fp" ] || fp="chrome"
     printf 'vless://%s@%s:%s?encryption=none%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
-        "$N_UUID" "$ip" "$N_PORT" "$flow" "$N_SNI" "$fp" "$N_PUB" "$N_SID" "$enc"
+        "$N_UUID" "$ip" "$public_port" "$flow" "$N_SNI" "$fp" "$N_PUB" "$N_SID" "$enc"
 }
 
 gen_config() {
@@ -1558,6 +1562,7 @@ new_node_record() {
     N_ID="$id"
     N_NAME="$1"
     N_PORT="$2"
+    N_PUBLIC_PORT="$2"
     N_UUID="$uuid"
     N_PRIV="$priv"
     N_PUB="$pub"
@@ -1594,6 +1599,16 @@ create_node() {
         port=$(sanitize_text "$REPLY")
     done
     port=$(to_int "$port")
+
+    prompt_default "面板外部映射端口 (直连填写同监听端口)" "$port"
+    public_port=$(sanitize_text "$REPLY")
+    while ! is_uint "$public_port" || [ "$(to_int "$public_port")" -lt 1 ] || [ "$(to_int "$public_port")" -gt 65535 ]; do
+        warn "请输入 1-65535 之间的外部端口"
+        prompt_default "面板外部映射端口" "$port"
+        public_port=$(sanitize_text "$REPLY")
+    done
+    N_PUBLIC_PORT=$(to_int "$public_port")
+    public_port="$N_PUBLIC_PORT"
 
     prompt_default "SNI (Reality 伪装域名)" "$DEFAULT_SNI"
     sni=$(sanitize_text "$REPLY")
@@ -1644,6 +1659,9 @@ create_node() {
     esac
 
     nid=$(new_node_record "$name" "$port" "$sni" "$dest" "$DEFAULT_FLOW" "$DEFAULT_FP" "$quota" "$rate" "$days") || die "创建节点失败"
+    load_node "$nid"
+    N_PUBLIC_PORT="$public_port"
+    save_node || warn "节点已创建，但外部映射端口保存失败"
     if ! apply_config; then
         warn "节点已保存，但配置应用失败，请检查后重试"
         return 1
@@ -1727,6 +1745,9 @@ batch_create() {
             break
         }
         created="$created $nid"
+        load_node "$nid"
+        N_PUBLIC_PORT="$N_PORT"
+        save_node || warn "节点 $nid 外部端口初始化失败"
         i=$((i + 1))
     done
 
@@ -1754,7 +1775,8 @@ show_node_detail() {
     load_state "$1"
     printf 'ID       : %s\n' "$N_ID"
     printf '名称     : %s\n' "$N_NAME"
-    printf '端口     : %s\n' "$N_PORT"
+    printf '监听端口 : %s\n' "$N_PORT"
+    [ "$N_PUBLIC_PORT" = "$N_PORT" ] || printf '外部端口 : %s (面板映射)\n' "$N_PUBLIC_PORT"
     printf '状态     : %s\n' "$(node_status)"
     printf 'SNI      : %s\n' "$N_SNI"
     printf '目标     : %s\n' "$N_DEST"
@@ -1785,15 +1807,15 @@ show_nodes() {
         warn "还没有节点，请先创建"
         return 0
     fi
-    printf '%-4s %-18s %-7s %-10s %-24s %-12s %s\n' 'ID' '名称' '端口' '状态' '本月用量 / 限额' '总流量' '到期'
+    printf '%-4s %-18s %-7s %-7s %-10s %-24s %-12s %s\n' 'ID' '名称' '监听' '外部' '状态' '本月用量 / 限额' '总流量' '到期'
     printf '%s\n' '-----------------------------------------------------------------------------------------------'
     for id in $ids; do
         load_node "$id" || continue
         load_state "$id"
         state=$(node_status)
         color=$(status_color "$state")
-        printf '%-4s %-18.18s %-7s %s%-10s%s %-24s %-12s %s\n' \
-            "$id" "$N_NAME" "$N_PORT" "$color" "$state" "$C_NC" \
+        printf '%-4s %-18.18s %-7s %-7s %s%-10s%s %-24s %-12s %s\n' \
+            "$id" "$N_NAME" "$N_PORT" "$N_PUBLIC_PORT" "$color" "$state" "$C_NC" \
             "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")"
     done
     printf '\n图例: %s正常%s  %s即将到期%s  %s已禁用/已到期/超月限额%s\n' \
@@ -1865,11 +1887,12 @@ modify_node() {
         clear_screen
         show_node_detail "$id"
         printf '\n'
-        printf ' 1. 修改名称        2. 修改端口\n'
+        printf ' 1. 修改名称        2. 修改监听端口\n'
         printf ' 3. 修改 SNI/目标   4. 修改流控\n'
         printf ' 5. 修改指纹        6. 重置 UUID\n'
         printf ' 7. 重置 Reality 密钥  8. 修改备注\n'
-        printf ' 9. 查看节点链接    0. 返回\n'
+        printf ' 9. 查看节点链接   10. 修改外部映射端口\n'
+        printf ' 0. 返回\n'
         printf '请选择: '
         read -r c 2>/dev/null || c=""
         case "$c" in
@@ -1881,14 +1904,16 @@ modify_node() {
                 ok "名称已修改"
                 ;;
             2)
-                prompt_default "新端口" "$N_PORT"
+                prompt_default "新监听端口" "$N_PORT"
                 p=$(sanitize_text "$REPLY")
                 while ! validate_change_port "$p" "$id"; do
                     warn "端口无效、被占用或是 API 端口"
                     prompt_default "新端口" "$N_PORT"
                     p=$(sanitize_text "$REPLY")
                 done
+                old_port="$N_PORT"
                 N_PORT=$(to_int "$p")
+                [ "$N_PUBLIC_PORT" = "$old_port" ] && N_PUBLIC_PORT="$N_PORT"
                 save_node
                 apply_config || true
                 apply_tc_all
@@ -1983,6 +2008,20 @@ modify_node() {
                 CACHED_IP=$(get_public_ip)
                 printf '\n%s\n\n' "$(build_link)"
                 unset CACHED_IP
+                ;;
+            10)
+                prompt_default "外部映射端口" "$N_PUBLIC_PORT"
+                p=$(sanitize_text "$REPLY")
+                if is_uint "$p" && [ "$(to_int "$p")" -ge 1 ] && [ "$(to_int "$p")" -le 65535 ]; then
+                    N_PUBLIC_PORT=$(to_int "$p")
+                    save_node || warn "外部端口保存失败"
+                    ok "外部端口已更新，客户端链接已按新端口生成"
+                    CACHED_IP=$(get_public_ip)
+                    printf '%s\n' "$(build_link)"
+                    unset CACHED_IP
+                else
+                    warn "请输入 1-65535 之间的端口"
+                fi
                 ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -2332,7 +2371,7 @@ xray_status_log() {
     else
         printf 'Xray 版本: 未安装\n'
     fi
-    printf '运行状态: %s\n' "$(xray_status_text)"
+        printf '运行状态: %s\n' "$(xray_status_text)"
     if openrc_active; then
         printf '服务状态: %s\n' "$(rc-service xray status 2>&1 | head -n 1)"
     elif systemd_active; then
@@ -2561,6 +2600,11 @@ system_info() {
     [ -n "$cron_count" ] || cron_count=0
     printf '监控任务 : %s\n' "$cron_count"
     printf '磁盘 /   : %s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+    printf 'inode /  : %s\n' "$(df -i / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+    if need_cmd free; then
+        printf '内存     : %s\n' "$(free -h 2>/dev/null | awk '/^Mem:/{print $3" / "$2}')"
+    fi
+    printf 'init     : %s\n' "$(if systemd_active; then printf 'systemd'; elif openrc_active; then printf 'OpenRC'; else printf '未知/容器'; fi)"
     printf '\n%s依赖检查%s\n\n' "$C_BOLD" "$C_NC"
     for c in curl wget unzip jq nft tc ss iptables qrencode openssl timeout; do
         if need_cmd "$c"; then
@@ -2577,7 +2621,6 @@ test_nodes() {
         warn "还没有节点"
         return 0
     fi
-    ip=$(get_public_ip)
     for id in $ids; do
         load_node "$id" || continue
         load_state "$id"
@@ -2586,16 +2629,44 @@ test_nodes() {
         else
             local_status="本地未监听"
         fi
-        ext_status="未测试"
-        if need_cmd nc; then
-            if nc -z -w 3 "$ip" "$N_PORT" >/dev/null 2>&1; then
-                ext_status="公网端口可达"
-            else
-                ext_status="公网端口不可达/被防火墙拦截"
-            fi
-        fi
-        printf '[%s] %s 端口 %s | 状态 %s | %s | %s\n' "$id" "$N_NAME" "$N_PORT" "$(node_status)" "$local_status" "$ext_status"
+        printf '[%s] %s 内部 %s -> 外部 %s | 状态 %s | %s\n' \
+            "$id" "$N_NAME" "$N_PORT" "$N_PUBLIC_PORT" "$(node_status)" "$local_status"
     done
+    printf '\n外部端口映射无法从实例内部可靠确认。请从另一台设备测试公网地址:外部端口，并确认面板 TCP 映射目标为本机监听端口。\n'
+}
+
+nat_diagnostics() {
+    printf '%sNAT VPS 部署检查%s\n\n' "$C_BOLD" "$C_NC"
+    printf '公网地址 : %s\n' "$(get_public_ip)"
+    printf '本机地址 : %s\n' "$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}')"
+    printf '默认路由 : %s\n' "$(ip route show default 2>/dev/null | head -n 1)"
+    printf '服务管理 : %s\n' "$(if systemd_active; then printf 'systemd'; elif openrc_active; then printf 'OpenRC'; else printf '非标准 init/容器'; fi)"
+    printf 'Xray 状态: %s\n' "$(xray_status_text)"
+    printf 'SSH 监听 : '
+    if need_cmd ss; then
+        ssh_listeners=$(ss -lnt 2>/dev/null | awk 'NR>1 && $4 ~ /:22$/ {print $4}')
+        [ -n "$ssh_listeners" ] && printf '%s\n' "$ssh_listeners" || printf '未发现 TCP/22 监听\n'
+    else
+        printf '缺少 ss，无法检查\n'
+    fi
+    printf '\n节点端口检查:\n'
+    ids=$(node_ids)
+    if [ -z "$ids" ]; then
+        printf '  暂无节点\n'
+    else
+        for id in $ids; do
+            load_node "$id" || continue
+            if port_listening "$N_PORT"; then local_status='监听中'; else local_status='未监听'; fi
+            printf '  [%s] %s 监听 %s -> 映射 %s (%s)\n' \
+                "$id" "$N_NAME" "$N_PORT" "$N_PUBLIC_PORT" "$local_status"
+        done
+    fi
+    printf '\n面板中的外部端口必须映射到实例对应监听端口；本检查无法读取 NAT 面板规则。\n'
+    printf '请从实例外部网络检查 TCP 连通性；同时核对实例状态、端口额度和防火墙策略。\n'
+    printf '资源状态: 内存 %s | 磁盘 %s | inode %s\n' \
+        "$(free -h 2>/dev/null | awk '/^Mem:/{print $3"/"$2}')" \
+        "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')" \
+        "$(df -i / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
 }
 
 SNI_DATA_DIR="/usr/local/share/rysh"
@@ -2987,6 +3058,7 @@ main_menu() {
         printf '21. 备份/恢复                  22. 系统信息/依赖检查\n'
         printf '23. 卸载                       24. 编辑 Xray 配置\n'
         printf '25. 测试节点连通性             26. Reality SNI 检测\n'
+        printf '27. NAT VPS 部署检查\n'
         printf '                                   0. 退出\n'
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
@@ -3018,6 +3090,7 @@ main_menu() {
             24) edit_config; pause ;;
             25) test_nodes; pause ;;
             26) check_sni_candidates; pause ;;
+            27) nat_diagnostics; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
