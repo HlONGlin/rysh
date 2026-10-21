@@ -2626,9 +2626,9 @@ quick_sni_detect() {
     best_time=""
     for host in $candidates; do
         if sni_host_risk "$host"; then continue; fi
-        result=$(timeout 6 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -verify_return_error -verify_hostname "$host" -brief </dev/null 2>&1)
+        result=$(timeout 6 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -verify_return_error -verify_hostname "$host" -showcerts </dev/null 2>&1)
         printf '%s\n' "$result" | grep -qiE 'Protocol version: TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' || continue
-        printf '%s\n' "$result" | grep -qiE 'Negotiated ALPN protocol: h2|ALPN protocol: h2' || continue
+        printf '%s\n' "$result" | grep -qiE '(Negotiated )?ALPN protocol: h2' || continue
         printf '%s\n' "$result" | grep -qiE 'Verification: OK|Verify return code: 0 \(ok\)' || continue
         printf '%s\n' "$result" | grep -qi 'X25519' || continue
         timing=$(curl -sS -o /dev/null --http1.1 --connect-timeout 4 --max-time 6 -w '%{time_appconnect}' "https://$host/" 2>/dev/null)
@@ -2695,16 +2695,16 @@ check_sni_candidates() {
             printf '%-34s %s\n' "$host" '跳过: 域名格式无效'
             continue
         }
-        info=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -brief </dev/null 2>&1)
+        info=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -showcerts </dev/null 2>&1)
         tls="否"
         alpn="否"
         key="未知"
         cert="否"
         printf '%s\n' "$info" | grep -qiE 'Protocol version: TLSv1\.3|Protocol *: *TLSv1\.3|New, TLSv1\.3' && tls="是"
-        printf '%s\n' "$info" | grep -qi 'Negotiated ALPN protocol: h2' && alpn="是"
-        key=$(printf '%s\n' "$info" | awk -F': ' 'tolower($1) ~ /peer.*temp.*key/ {print $2; exit}')
+        printf '%s\n' "$info" | grep -qiE '(Negotiated )?ALPN protocol: h2' && alpn="是"
+        key=$(printf '%s\n' "$info" | awk 'tolower($0) ~ /(peer|server) temp key:/ {sub(/^.*[Tt]emp [Kk]ey: */, ""); sub(/,.*/, ""); print; exit}')
         [ -n "$key" ] || key="未知"
-        verify=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -verify_return_error -verify_hostname "$host" -brief </dev/null 2>&1)
+        verify=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 -verify_return_error -verify_hostname "$host" -showcerts </dev/null 2>&1)
         printf '%s\n' "$verify" | grep -qiE 'Verification: OK|Verify return code: 0 \(ok\)' && cert="是"
         timing=$(curl -sS -o /dev/null --http1.1 --connect-timeout 5 --max-time 8 -w '%{time_appconnect}' "https://$host/" 2>/dev/null)
         case "$timing" in ''|*[!0-9.]*) timing="超时" ;; esac
@@ -2713,16 +2713,33 @@ check_sni_candidates() {
         result="不合规"
         risk="否"
         if sni_host_risk "$host"; then risk="是"; fi
+        x25519="否"
+        printf '%s' "$key" | grep -qi 'X25519' && x25519="是"
+        if [ "$x25519" != "是" ] && [ "$tls" = "是" ] && [ "$cert" = "是" ]; then
+            openssl_help=$(openssl s_client -help 2>&1)
+            case "$openssl_help" in
+                *-groups*) group_arg="-groups" ;;
+                *-curves*) group_arg="-curves" ;;
+                *) group_arg="" ;;
+            esac
+            if [ -n "$group_arg" ]; then
+                xinfo=$(timeout 8 openssl s_client -connect "$host:443" -servername "$host" -tls1_3 -alpn h2 "$group_arg" X25519 -verify_return_error -verify_hostname "$host" </dev/null 2>&1)
+                printf '%s\n' "$xinfo" | grep -qi 'X25519' && x25519="是"
+            fi
+        fi
         if [ "$risk" = "是" ]; then
             result="风险后缀"
-        elif [ "$tls" = "是" ] && [ "$alpn" = "是" ] && [ "$cert" = "是" ] && printf '%s' "$key" | grep -qi 'X25519'; then
+        elif [ "$tls" = "是" ] && [ "$alpn" = "是" ] && [ "$cert" = "是" ] && [ "$x25519" = "是" ]; then
             result="推荐"
             if [ "$timing" != "超时" ] && { [ -z "$best_time" ] || awk -v a="$timing" -v b="$best_time" 'BEGIN{exit !(a<b)}'; }; then
                 best_time="$timing"
                 best_host="$host"
             fi
         elif [ "$tls" = "是" ] && [ "$cert" = "是" ]; then
-            result="可用性待確認"
+            missing=""
+            [ "$alpn" = "是" ] || missing="h2"
+            [ "$x25519" = "是" ] || missing="${missing}${missing:+/}X25519"
+            result="可用(缺少 $missing)"
         fi
         printf '%-34s %-9s %-7s %-5s %-10s %-8s %-9s %s\n' "$host" "$timing" "$tls" "$alpn" "$key" "$cert" "$region" "$result"
     done
