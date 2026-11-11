@@ -1,6 +1,6 @@
 #!/bin/sh
 
-RYSH_VERSION="1.0.5"
+RYSH_VERSION="1.1.0"
 RYSH_DIR="${RYSH_DIR:-/etc/rysh}"
 NODE_DIR="$RYSH_DIR/nodes"
 STATE_DIR="$RYSH_DIR/state"
@@ -180,6 +180,32 @@ sanitize_text() {
     printf '%s' "$1" | tr -d "'" | tr -d '\r' | tr -d '\n'
 }
 
+# UTF-8 安全地截断并按显示宽度补空格。用法: pad_text TEXT WIDTH
+# ASCII 占 1 列，其余多字节字符按 2 列计算
+pad_text() {
+    printf '%s\n' "$1" | LC_ALL=C awk -v w="$2" '
+        BEGIN {
+            for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+            target = w + 0
+        }
+        {
+            s = $0; out = ""; cols = 0; i = 1; n = length(s)
+            while (i <= n) {
+                b = ORD[substr(s, i, 1)] + 0
+                if (b >= 240)      { lenb = 4; cw = 2 }
+                else if (b >= 224) { lenb = 3; cw = 2 }
+                else if (b >= 192) { lenb = 2; cw = 2 }
+                else               { lenb = 1; cw = 1 }
+                if (cols + cw > target) break
+                out = out substr(s, i, lenb)
+                cols += cw
+                i += lenb
+            }
+            printf "%s", out
+            while (cols < target) { printf " "; cols++ }
+        }'
+}
+
 is_uint() {
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
@@ -213,6 +239,9 @@ load_settings() {
     MONITOR_INTERVAL="1"
     IFACE=""
     DOWNLOAD_PROXY=""
+    DEFAULT_OUT_B64=""
+    DEFAULT_OUT_LABEL=""
+    DEFAULT_OUT_JSON=""
     if [ -f "$SETTINGS_FILE" ]; then
         . "$SETTINGS_FILE"
     fi
@@ -223,6 +252,13 @@ load_settings() {
     MONITOR_INTERVAL=$(to_int "$MONITOR_INTERVAL")
     [ "$MONITOR_INTERVAL" -ge 1 ] 2>/dev/null || MONITOR_INTERVAL="1"
     [ "$MONITOR_INTERVAL" -le 59 ] 2>/dev/null || MONITOR_INTERVAL="1"
+    if [ -n "$DEFAULT_OUT_B64" ]; then
+        DEFAULT_OUT_JSON=$(b64decode "$DEFAULT_OUT_B64" 2>/dev/null)
+        printf '%s' "$DEFAULT_OUT_JSON" | jq -e . >/dev/null 2>&1 || {
+            DEFAULT_OUT_JSON=""
+            DEFAULT_OUT_LABEL=""
+        }
+    fi
 }
 
 save_settings() {
@@ -236,6 +272,8 @@ save_settings() {
         printf "MONITOR_INTERVAL='%s'\n" "$MONITOR_INTERVAL"
         printf "IFACE='%s'\n" "$(sanitize_text "$IFACE")"
         printf "DOWNLOAD_PROXY='%s'\n" "$(sanitize_text "$DOWNLOAD_PROXY")"
+        printf "DEFAULT_OUT_B64='%s'\n" "$(settings_out_b64)"
+        printf "DEFAULT_OUT_LABEL='%s'\n" "$(sanitize_text "$DEFAULT_OUT_LABEL")"
     } > "$tmp" || return 1
     mv "$tmp" "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
@@ -1227,6 +1265,10 @@ load_node() {
     N_QUOTA_GB="0"
     N_RATE_MBPS="0"
     N_REMARK=""
+    N_OUT_MODE="inherit"
+    N_OUT_B64=""
+    N_OUT_LABEL=""
+    N_OUT_JSON=""
     f="$NODE_DIR/$1.conf"
     [ -f "$f" ] || return 1
     . "$f"
@@ -1239,6 +1281,21 @@ load_node() {
     N_RATE_MBPS=${N_RATE_MBPS:-0}
     N_FLOW=${N_FLOW:-}
     N_FP=${N_FP:-chrome}
+    N_OUT_MODE=${N_OUT_MODE:-inherit}
+    N_OUT_B64=${N_OUT_B64:-}
+    N_OUT_LABEL=${N_OUT_LABEL:-}
+    case "$N_OUT_MODE" in
+        inherit|direct|custom) ;;
+        *) N_OUT_MODE="inherit" ;;
+    esac
+    if [ -n "$N_OUT_B64" ]; then
+        N_OUT_JSON=$(b64decode "$N_OUT_B64" 2>/dev/null)
+        printf '%s' "$N_OUT_JSON" | jq -e . >/dev/null 2>&1 || {
+            N_OUT_JSON=""
+            N_OUT_MODE="direct"
+            N_OUT_LABEL=""
+        }
+    fi
     return 0
 }
 
@@ -1264,6 +1321,9 @@ save_node() {
         printf "N_QUOTA_GB='%s'\n" "$N_QUOTA_GB"
         printf "N_RATE_MBPS='%s'\n" "$N_RATE_MBPS"
         printf "N_REMARK='%s'\n" "$(sanitize_text "$N_REMARK")"
+        printf "N_OUT_MODE='%s'\n" "${N_OUT_MODE:-inherit}"
+        printf "N_OUT_B64='%s'\n" "$(node_out_b64)"
+        printf "N_OUT_LABEL='%s'\n" "$(sanitize_text "$N_OUT_LABEL")"
     } > "$tmp" || return 1
     mv "$tmp" "$NODE_DIR/$N_ID.conf"
     chmod 600 "$NODE_DIR/$N_ID.conf"
@@ -1503,6 +1563,33 @@ urlencode() {
     printf '%s' "$1" | jq -sRr @uri 2>/dev/null || printf '%s' "$1"
 }
 
+b64encode() {
+    if need_cmd base64; then
+        printf '%s' "$1" | base64 2>/dev/null | tr -d '\r\n'
+        return
+    fi
+    printf '%s' "$1" | openssl base64 2>/dev/null | tr -d '\r\n'
+}
+
+b64decode() {
+    if need_cmd base64; then
+        printf '%s' "$1" | base64 -d 2>/dev/null && return 0
+        printf '%s' "$1" | base64 --decode 2>/dev/null && return 0
+    fi
+    printf '%s' "$1" | openssl base64 -d -A 2>/dev/null
+}
+
+node_out_b64() {
+    [ "$N_OUT_MODE" = "custom" ] || return 0
+    [ -n "$N_OUT_JSON" ] || return 0
+    b64encode "$(printf '%s' "$N_OUT_JSON" | jq -c . 2>/dev/null)"
+}
+
+settings_out_b64() {
+    [ -n "${DEFAULT_OUT_JSON:-}" ] || return 0
+    b64encode "$(printf '%s' "$DEFAULT_OUT_JSON" | jq -c . 2>/dev/null)"
+}
+
 build_link() {
     ip="${CACHED_IP:-$(get_public_ip)}"
     public_port="${N_PUBLIC_PORT:-$N_PORT}"
@@ -1513,6 +1600,469 @@ build_link() {
     [ -n "$fp" ] || fp="chrome"
     printf 'vless://%s@%s:%s?encryption=none%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
         "$N_UUID" "$ip" "$public_port" "$flow" "$N_SNI" "$fp" "$N_PUB" "$N_SID" "$enc"
+}
+
+urldecode() {
+    printf '%s' "$1" | awk '
+        function hex2dec(h,   i, c, d, v) {
+            v = 0
+            for (i = 1; i <= length(h); i++) {
+                c = tolower(substr(h, i, 1))
+                d = index("0123456789abcdef", c) - 1
+                if (d < 0) return -1
+                v = v * 16 + d
+            }
+            return v
+        }
+        {
+            s = $0; out = ""
+            while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+                out = out substr(s, 1, RSTART - 1)
+                out = out sprintf("%c", hex2dec(substr(s, RSTART + 1, 2)))
+                s = substr(s, RSTART + 3)
+            }
+            out = out s
+            gsub(/\+/, " ", out)
+            printf "%s", out
+        }'
+}
+
+b64decode_any() {
+    s=$(printf '%s' "$1" | tr '\-_' '+/' | tr -d '\r\n')
+    case $(( ${#s} % 4 )) in
+        2) s="$s==" ;;
+        3) s="$s=" ;;
+    esac
+    b64decode "$s"
+}
+
+# 生成 streamSettings: 参数依次为 network security sni host path fp pbk sid alpn serviceName
+build_stream_settings() {
+    jq -nc \
+        --arg net "$1" --arg sec "$2" --arg sni "$3" --arg host "$4" \
+        --arg path "$5" --arg fp "$6" --arg pbk "$7" --arg sid "$8" \
+        --arg alpn "$9" --arg svc "${10}" '
+        def alpn_list($a): if $a == "" then ["h2","http/1.1"] else ($a | split(",")) end;
+        ({network: (if $net == "" then "tcp" else $net end)})
+        + (if $sec == "tls" then
+             {security: "tls",
+              tlsSettings: ({serverName: $sni}
+                            + (if $fp == "" then {} else {fingerprint: $fp} end)
+                            + (if $alpn == "" then {} else {alpn: alpn_list($alpn)} end))}
+           elif $sec == "reality" then
+             {security: "reality",
+              realitySettings: ({serverName: $sni}
+                                + (if $fp == "" then {} else {fingerprint: $fp} end)
+                                + {publicKey: $pbk, shortId: $sid})}
+           else {} end)
+        + (if $net == "ws" then
+             {wsSettings: ({path: (if $path == "" then "/" else $path end)}
+                           + (if $host == "" then {} else {headers: {Host: $host}} end))}
+           elif $net == "grpc" then
+             {grpcSettings: ({serviceName: $svc} + (if $host == "" then {} else {} end))}
+           elif $net == "http" or $net == "h2" then
+             {httpSettings: ({path: (if $path == "" then "/" else $path end)}
+                             + (if $host == "" then {} else {host: [$host]} end))}
+           elif $net == "kcp" or $net == "mkcp" then
+             {kcpSettings: {header: {type: "none"}}}
+           else {} end)'
+}
+
+# 解析 host:port 形式的地址，兼容 [IPv6]:port
+split_hostport() {
+    hp="$1"
+    host=""
+    port=""
+    case "$hp" in
+        \[*\]*)
+            host=${hp%%]*}
+            host=${host#[}
+            rest=${hp#*]}
+            case "$rest" in
+                :*) port=${rest#:} ;;
+            esac
+            ;;
+        *:*)
+            host=${hp%:*}
+            port=${hp##*:}
+            ;;
+    esac
+    is_uint "$port" || return 1
+    port=$(to_int "$port")
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    [ -n "$host" ] || return 1
+    return 0
+}
+
+# query 参数提取: get_query_param QUERY KEY
+get_query_param() {
+    printf '%s' "$1" | tr '&' '\n' | awk -F= -v k="$2" '
+        $1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+outbound_reset() {
+    OUT_JSON=""
+    OUT_LABEL=""
+    OUT_KIND=""
+}
+
+# 解析 SOCKS/HTTP 代理 URL
+parse_proxy_url() {
+    raw="$1"
+    scheme=$(printf '%s' "$raw" | tr 'A-Z' 'a-z')
+    scheme=${scheme%%://*}
+    rest=${raw#*://}
+    frag=""
+    case "$rest" in
+        *'#'*) frag=${rest#*#}; rest=${rest%%#*} ;;
+    esac
+    case "$rest" in
+        *'/'*) rest=${rest%%/*} ;;
+    esac
+    user=""
+    pass=""
+    case "$rest" in
+        *'@'*)
+            userinfo=${rest%%@*}
+            rest=${rest#*@}
+            user=$(urldecode "${userinfo%%:*}")
+            case "$userinfo" in
+                *:*) pass=$(urldecode "${userinfo#*:}") ;;
+            esac
+            ;;
+    esac
+    split_hostport "$rest" || return 1
+    case "$scheme" in
+        http|https) proto="http" ;;
+        *) proto="socks" ;;
+    esac
+    if [ -n "$user" ] || [ -n "$pass" ]; then
+        OUT_JSON=$(jq -nc --arg p "$proto" --arg a "$host" --argjson pt "$port" \
+            --arg u "$user" --arg w "$pass" \
+            '{protocol: $p, settings: {servers: [{address: $a, port: $pt, users: [{user: $u, pass: $w}]}]}}') || return 1
+    else
+        OUT_JSON=$(jq -nc --arg p "$proto" --arg a "$host" --argjson pt "$port" \
+            '{protocol: $p, settings: {servers: [{address: $a, port: $pt}]}}') || return 1
+    fi
+    OUT_KIND="$proto"
+    if [ -n "$user" ]; then
+        OUT_LABEL="$proto://$user@$host:$port"
+    else
+        OUT_LABEL="$proto://$host:$port"
+    fi
+    [ -n "$frag" ] && OUT_LABEL="$OUT_LABEL ($(urldecode "$frag"))"
+    return 0
+}
+
+parse_vmess_url() {
+    body=${1#*://}
+    case "$body" in
+        *'#'*) body=${body%%#*} ;;
+    esac
+    json=$(b64decode_any "$body")
+    printf '%s' "$json" | jq -e . >/dev/null 2>&1 || return 1
+    add=$(printf '%s' "$json" | jq -r '.add // ""')
+    pt=$(printf '%s' "$json" | jq -r '.port // ""')
+    id=$(printf '%s' "$json" | jq -r '.id // ""')
+    aid=$(printf '%s' "$json" | jq -r '(.aid // 0) | tostring')
+    scy=$(printf '%s' "$json" | jq -r '.scy // "auto"')
+    net=$(printf '%s' "$json" | jq -r '.net // "tcp"')
+    vhost=$(printf '%s' "$json" | jq -r '.host // ""')
+    path=$(printf '%s' "$json" | jq -r '.path // ""')
+    tlsv=$(printf '%s' "$json" | jq -r '.tls // ""')
+    sni=$(printf '%s' "$json" | jq -r '.sni // ""')
+    fp=$(printf '%s' "$json" | jq -r '.fp // ""')
+    alpn=$(printf '%s' "$json" | jq -r 'if (.alpn // "") == "" then "" else ((.alpn | if type == "array" then join(",") else . end)) end')
+    svc=$(printf '%s' "$json" | jq -r '.path // ""')
+    [ -n "$add" ] || return 1
+    split_hostport "$add:$pt" || return 1
+    vaddr="$host"
+    [ -n "$id" ] || return 1
+    case "$tlsv" in
+        tls|reality|"") ;;
+        *) tlsv="tls" ;;
+    esac
+    sec="$tlsv"
+    [ -n "$sni" ] || sni="$vhost"
+    [ -n "$sni" ] || sni="$vaddr"
+    case "$net" in
+        ws|grpc|h2|http|kcp|mkcp|tcp) ;;
+        *) net="tcp" ;;
+    esac
+    settings=$(jq -nc --arg a "$vaddr" --argjson pt "$port" --arg id "$id" \
+        --arg scy "$scy" \
+        '{vnext: [{address: $a, port: $pt, users: [{id: $id, alterId: 0, security: $scy}]}]}') || return 1
+    stream=$(build_stream_settings "$net" "$sec" "$sni" "$vhost" "$path" "$fp" "" "" "$alpn" "$svc") || return 1
+    OUT_JSON=$(jq -nc --argjson s "$settings" --argjson st "$stream" \
+        '{protocol: "vmess", settings: $s, streamSettings: $st}') || return 1
+    OUT_KIND="vmess"
+    OUT_LABEL="vmess://$vaddr:$port"
+    [ -n "$vhost" ] && OUT_LABEL="$OUT_LABEL ($vhost)"
+    return 0
+}
+
+parse_vless_url() {
+    raw="$1"
+    rest=${raw#*://}
+    frag=""
+    case "$rest" in
+        *'#'*) frag=${rest#*#}; rest=${rest%%#*} ;;
+    esac
+    query=""
+    case "$rest" in
+        *'?'*) query=${rest#*\?}; rest=${rest%%\?*} ;;
+    esac
+    case "$rest" in
+        *'@'*)
+            uuid=$(urldecode "${rest%%@*}")
+            hostport=${rest#*@}
+            ;;
+        *) return 1 ;;
+    esac
+    [ -n "$uuid" ] || return 1
+    split_hostport "$hostport" || return 1
+    sec=$(get_query_param "$query" security)
+    net=$(get_query_param "$query" type)
+    sni=$(urldecode "$(get_query_param "$query" sni)")
+    fp=$(get_query_param "$query" fp)
+    pbk=$(urldecode "$(get_query_param "$query" pbk)")
+    sid=$(urldecode "$(get_query_param "$query" sid)")
+    flowv=$(get_query_param "$query" flow)
+    path=$(urldecode "$(get_query_param "$query" path)")
+    qhost=$(urldecode "$(get_query_param "$query" host)")
+    alpn=$(urldecode "$(get_query_param "$query" alpn)")
+    svc=$(get_query_param "$query" serviceName)
+    [ -n "$sec" ] || sec="none"
+    [ -n "$net" ] || net="tcp"
+    [ -n "$sni" ] || sni="$qhost"
+    case "$sec" in
+        tls)
+            stream=$(build_stream_settings "$net" tls "$sni" "$qhost" "$path" "$fp" "" "" "$alpn" "$svc") || return 1
+            ;;
+        reality)
+            stream=$(build_stream_settings "$net" reality "$sni" "$qhost" "$path" "$fp" "$pbk" "$sid" "" "$svc") || return 1
+            ;;
+        *)
+            stream=$(build_stream_settings "$net" none "$sni" "$qhost" "$path" "" "" "" "" "$svc") || return 1
+            ;;
+    esac
+    settings=$(jq -nc --arg a "$host" --argjson pt "$port" --arg id "$uuid" --arg fl "$flowv" \
+        '{vnext: [{address: $a, port: $pt, users: ([{id: $id, encryption: "none"}] | map(if $fl == "" then . else . + {flow: $fl} end))}]}') || return 1
+    OUT_JSON=$(jq -nc --argjson s "$settings" --argjson st "$stream" \
+        '{protocol: "vless", settings: $s, streamSettings: $st}') || return 1
+    OUT_KIND="vless"
+    OUT_LABEL="vless://$uuid@$host:$port"
+    [ -n "$frag" ] && OUT_LABEL="$OUT_LABEL ($(urldecode "$frag"))"
+    return 0
+}
+
+parse_trojan_url() {
+    raw="$1"
+    rest=${raw#*://}
+    frag=""
+    case "$rest" in
+        *'#'*) frag=${rest#*#}; rest=${rest%%#*} ;;
+    esac
+    query=""
+    case "$rest" in
+        *'?'*) query=${rest#*\?}; rest=${rest%%\?*} ;;
+    esac
+    case "$rest" in
+        *'@'*)
+            pw=$(urldecode "${rest%%@*}")
+            hostport=${rest#*@}
+            ;;
+        *) return 1 ;;
+    esac
+    [ -n "$pw" ] || return 1
+    split_hostport "$hostport" || return 1
+    sec=$(get_query_param "$query" security)
+    net=$(get_query_param "$query" type)
+    sni=$(urldecode "$(get_query_param "$query" sni)")
+    fp=$(get_query_param "$query" fp)
+    path=$(urldecode "$(get_query_param "$query" path)")
+    qhost=$(urldecode "$(get_query_param "$query" host)")
+    alpn=$(urldecode "$(get_query_param "$query" alpn)")
+    svc=$(get_query_param "$query" serviceName)
+    [ -n "$sec" ] || sec="tls"
+    [ -n "$net" ] || net="tcp"
+    [ -n "$sni" ] || sni="$qhost"
+    case "$sec" in
+        none) stream=$(build_stream_settings "$net" none "$sni" "$qhost" "$path" "" "" "" "" "$svc") || return 1 ;;
+        reality) stream=$(build_stream_settings "$net" reality "$sni" "$qhost" "$path" "$fp" \
+                    "$(urldecode "$(get_query_param "$query" pbk)")" "$(urldecode "$(get_query_param "$query" sid)")" "" "$svc") || return 1 ;;
+        *) stream=$(build_stream_settings "$net" tls "$sni" "$qhost" "$path" "$fp" "" "" "$alpn" "$svc") || return 1 ;;
+    esac
+    settings=$(jq -nc --arg a "$host" --argjson pt "$port" --arg pw "$pw" \
+        '{servers: [{address: $a, port: $pt, password: $pw}]}') || return 1
+    OUT_JSON=$(jq -nc --argjson s "$settings" --argjson st "$stream" \
+        '{protocol: "trojan", settings: $s, streamSettings: $st}') || return 1
+    OUT_KIND="trojan"
+    OUT_LABEL="trojan://$host:$port"
+    [ -n "$frag" ] && OUT_LABEL="$OUT_LABEL ($(urldecode "$frag"))"
+    return 0
+}
+
+parse_ss_url() {
+    raw="$1"
+    rest=${raw#*://}
+    frag=""
+    case "$rest" in
+        *'#'*) frag=${rest#*#}; rest=${rest%%#*} ;;
+    esac
+    query=""
+    case "$rest" in
+        *'?'*) query=${rest#*\?}; rest=${rest%%\?*} ;;
+    esac
+    method=""
+    pw=""
+    case "$rest" in
+        *'@'*)
+            userinfo=${rest%%@*}
+            hostport=${rest#*@}
+            if printf '%s' "$userinfo" | grep -q ':'; then
+                decoded=$(urldecode "$userinfo")
+            else
+                decoded=$(b64decode_any "$userinfo")
+            fi
+            case "$decoded" in
+                *:*) method=${decoded%%:*}; pw=${decoded#*:} ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            decoded=$(b64decode_any "$rest")
+            case "$decoded" in
+                *'@'*)
+                    userinfo=${decoded%%@*}
+                    hostport=${decoded#*@}
+                    case "$userinfo" in
+                        *:*) method=${userinfo%%:*}; pw=${userinfo#*:} ;;
+                        *) return 1 ;;
+                    esac
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+    split_hostport "$hostport" || return 1
+    [ -n "$method" ] || return 1
+    settings=$(jq -nc --arg a "$host" --argjson pt "$port" --arg m "$method" --arg pw "$pw" \
+        '{servers: [{address: $a, port: $pt, method: $m, password: $pw}]}') || return 1
+    OUT_JSON=$(jq -nc --argjson s "$settings" '{protocol: "shadowsocks", settings: $s}') || return 1
+    OUT_KIND="shadowsocks"
+    OUT_LABEL="ss://$method@$host:$port"
+    [ -n "$frag" ] && OUT_LABEL="$OUT_LABEL ($(urldecode "$frag"))"
+    return 0
+}
+
+parse_outbound_any() {
+    raw=$(printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$raw" ] || return 1
+    outbound_reset
+    case "$raw" in
+        vmess://*) parse_vmess_url "$raw" ;;
+        vless://*) parse_vless_url "$raw" ;;
+        trojan://*) parse_trojan_url "$raw" ;;
+        ss://*) parse_ss_url "$raw" ;;
+        socks5://*|socks5h://*|socks4://*|socks://*) parse_proxy_url "$raw" ;;
+        http://*|https://*) parse_proxy_url "$raw" ;;
+        '{'*)
+            printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || return 1
+            OUT_JSON=$(printf '%s' "$raw" | jq -c .)
+            OUT_KIND=$(printf '%s' "$OUT_JSON" | jq -r '.protocol // "custom"')
+            OUT_LABEL="自定义 JSON"
+            ;;
+        *) return 1 ;;
+    esac
+    [ -n "$OUT_JSON" ] || return 1
+    printf '%s' "$OUT_JSON" | jq -c . >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 校验出口 JSON：去掉 tag 后写入临时配置进行 Xray 校验
+outbound_test_available() {
+    [ -x "$XRAY_BIN" ] && need_cmd jq
+}
+
+outbound_self_test() {
+    out_json="$1"
+    [ -n "$out_json" ] || return 1
+    outbound_test_available || return 0
+    tagged=$(outbound_with_tag "$out_json" "rysh-out-test") || return 1
+    [ -n "$tagged" ] || return 1
+    tmp="$XRAY_CONF_DIR/.outbound-test.$$.json"
+    {
+        printf '{\n  "outbounds": [\n'
+        printf '    {\n      "protocol": "freedom",\n      "tag": "direct"\n    },\n'
+        printf '    %s\n' "$tagged"
+        printf '  ]\n}\n'
+    } > "$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    OUT_TEST_MSG=$("$XRAY_BIN" run -test -c "$tmp" 2>&1)
+    status=$?
+    rm -f "$tmp"
+    [ "$status" -eq 0 ] && return 0
+    OUT_TEST_MSG=$(printf '%s\n' "$OUT_TEST_MSG" | grep -Ev '^(Xray |A unified platform|$)' | head -n 3)
+    return 1
+}
+
+outbound_with_tag() {
+    printf '%s' "$1" | jq -c --arg t "$2" 'del(.tag) + {tag: $t}' 2>/dev/null
+}
+
+# 解析节点实际使用的出口: 设置 R_OUT_JSON / R_OUT_TAG / R_OUT_KIND
+# 需要先 load_node
+resolve_node_outbound() {
+    R_OUT_JSON=""
+    R_OUT_TAG="direct"
+    R_OUT_KIND="direct"
+    case "$N_OUT_MODE" in
+        direct)
+            return 0
+            ;;
+        custom)
+            if [ -n "$N_OUT_JSON" ]; then
+                R_OUT_JSON="$N_OUT_JSON"
+                R_OUT_TAG="rysh-out-$N_ID"
+                R_OUT_KIND=$(printf '%s' "$N_OUT_JSON" | jq -r '.protocol // "custom"' 2>/dev/null)
+                [ -n "$R_OUT_KIND" ] || R_OUT_KIND="custom"
+            fi
+            return 0
+            ;;
+    esac
+    if [ -n "${DEFAULT_OUT_JSON:-}" ]; then
+        R_OUT_JSON="$DEFAULT_OUT_JSON"
+        R_OUT_TAG="rysh-out-default"
+        R_OUT_KIND=$(printf '%s' "$DEFAULT_OUT_JSON" | jq -r '.protocol // "custom"' 2>/dev/null)
+        [ -n "$R_OUT_KIND" ] || R_OUT_KIND="custom"
+    fi
+    return 0
+}
+
+# 出口摘要文本(用于节点详情/列表)
+node_outbound_summary() {
+    case "$N_OUT_MODE" in
+        custom)
+            if [ -n "$N_OUT_JSON" ]; then
+                printf '%s' "${N_OUT_LABEL:-自定义出口}"
+            else
+                printf '直出(出口配置无效)'
+            fi
+            ;;
+        direct)
+            printf '直出'
+            ;;
+        *)
+            if [ -n "${DEFAULT_OUT_JSON:-}" ]; then
+                printf '继承全局: %s' "${DEFAULT_OUT_LABEL:-自定义出口}"
+            else
+                printf '直出(继承全局，未设置)'
+            fi
+            ;;
+    esac
 }
 
 gen_config() {
@@ -1589,29 +2139,59 @@ JSON_HEAD
         printf '    }\n'
     done
 
-    cat <<'JSON_TAIL'
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["api"],
-        "outboundTag": "api"
-      }
-    ]
-  }
-}
-JSON_TAIL
+    printf '  ],\n'
+    printf '  "outbounds": [\n'
+    printf '    {\n'
+    printf '      "protocol": "freedom",\n'
+    printf '      "tag": "direct"\n'
+    printf '    },\n'
+    printf '    {\n'
+    printf '      "protocol": "blackhole",\n'
+    printf '      "tag": "block"\n'
+    printf '    }\n'
+
+    default_emitted=0
+    for id in $(node_ids); do
+        load_node "$id" || continue
+        [ "$N_ENABLED" = "1" ] || continue
+        resolve_node_outbound
+        [ -n "$R_OUT_JSON" ] || continue
+        if [ "$R_OUT_TAG" = "rysh-out-default" ]; then
+            [ "$default_emitted" = "1" ] && continue
+            default_emitted=1
+        fi
+        out_json=$(outbound_with_tag "$R_OUT_JSON" "$R_OUT_TAG") || continue
+        [ -n "$out_json" ] || continue
+        printf '    ,\n'
+        printf '    %s\n' "$out_json"
+    done
+
+    printf '  ],\n'
+    printf '  "routing": {\n'
+    printf '    "rules": [\n'
+    printf '      {\n'
+    printf '        "type": "field",\n'
+    printf '        "inboundTag": ["api"],\n'
+    printf '        "outboundTag": "api"\n'
+    printf '      }\n'
+
+    for id in $(node_ids); do
+        load_node "$id" || continue
+        [ "$N_ENABLED" = "1" ] || continue
+        resolve_node_outbound
+        [ -n "$R_OUT_JSON" ] || continue
+        [ "$R_OUT_TAG" = "direct" ] && continue
+        printf '      ,\n'
+        printf '      {\n'
+        printf '        "type": "field",\n'
+        printf '        "inboundTag": ["rysh-%s"],\n' "$N_ID"
+        printf '        "outboundTag": "%s"\n' "$R_OUT_TAG"
+        printf '      }\n'
+    done
+
+    printf '    ]\n'
+    printf '  }\n'
+    printf '}\n'
 }
 
 apply_config() {
@@ -2534,6 +3114,7 @@ show_node_detail() {
     else
         printf '限速     : %s Mbps\n' "$N_RATE_MBPS"
     fi
+    printf '出口     : %s\n' "$(node_outbound_summary)"
     printf '备注     : %s\n' "$N_REMARK"
 }
 
@@ -2543,16 +3124,18 @@ show_nodes() {
         warn "还没有节点，请先创建"
         return 0
     fi
-    printf '%-4s %-18s %-7s %-7s %-10s %-24s %-12s %s\n' 'ID' '名称' '监听' '外部' '状态' '本月用量 / 限额' '总流量' '到期'
-    printf '%s\n' '-----------------------------------------------------------------------------------------------'
+    printf '%-4s %s %-7s %-7s %-10s %-22s %-11s %-11s %s\n' \
+        'ID' "$(pad_text '名称' 22)" '监听' '外部' '状态' '本月用量 / 限额' '总流量' '到期' '出口'
+    printf '%s\n' '----------------------------------------------------------------------------------------------------------'
     for id in $ids; do
         load_node "$id" || continue
         load_state "$id"
         state=$(node_status)
         color=$(status_color "$state")
-        printf '%-4s %-18.18s %-7s %-7s %s%-10s%s %-24s %-12s %s\n' \
-            "$id" "$N_NAME" "$N_PORT" "$N_PUBLIC_PORT" "$color" "$state" "$C_NC" \
-            "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")"
+        printf '%-4s %s %-7s %-7s %s%-10s%s %-22s %-11s %-11s %s\n' \
+            "$id" "$(pad_text "$N_NAME" 22)" "$N_PORT" "$N_PUBLIC_PORT" "$color" "$state" "$C_NC" \
+            "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")" \
+            "$(node_outbound_summary)"
     done
     printf '\n图例: %s正常%s  %s即将到期%s  %s已禁用/已到期/超月限额%s\n' \
         "$C_GREEN" "$C_NC" "$C_YELLOW" "$C_NC" "$C_RED" "$C_NC"
@@ -2610,6 +3193,146 @@ export_links() {
     [ -s "$RYSH_DIR/subscription.txt" ] && ok "Base64 订阅已生成: $RYSH_DIR/subscription.txt"
 }
 
+# 交互输入出口链接，结果保存到 OUT_JSON / OUT_LABEL / OUT_KIND
+prompt_outbound_link() {
+    outbound_reset
+    printf '\n支持的格式:\n'
+    printf '  - v2rayN 分享链接: vmess:// vless:// trojan:// ss://\n'
+    printf '  - 代理 URL: socks5://user:pass@host:port#备注\n'
+    printf '             http://user:pass@host:port\n'
+    printf '  - 完整 outbound JSON (以 { 开头)\n\n'
+    printf '请输入出口链接(留空取消): '
+    read -r REPLY 2>/dev/null || REPLY=""
+    raw=$(printf '%s' "$REPLY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$raw" ] || return 1
+    if ! parse_outbound_any "$raw"; then
+        err "无法解析该出口链接，请检查格式"
+        return 1
+    fi
+    if ! outbound_self_test "$OUT_JSON"; then
+        err "出口配置未通过 Xray 校验"
+        [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+        outbound_reset
+        return 1
+    fi
+    return 0
+}
+
+# 读取一行多行 JSON；首行以 { 开头时持续读取直到空行
+prompt_outbound_json_multiline() {
+    printf '请粘贴完整 outbound JSON，输入空行结束:\n'
+    body=""
+    while :; do
+        read -r line 2>/dev/null || line=""
+        [ -z "$line" ] && [ -n "$body" ] && break
+        [ -z "$line" ] && break
+        body="$body$line
+"
+    done
+    printf '%s' "$body"
+}
+
+set_node_outbound_for_id() {
+    id="$1"
+    load_node "$id" || {
+        err "节点不存在"
+        return 1
+    }
+    while :; do
+        clear_screen
+        printf '%s设置节点出口%s\n\n' "$C_BOLD" "$C_NC"
+        printf '节点     : [%s] %s\n' "$N_ID" "$N_NAME"
+        printf '当前出口 : %s\n\n' "$(node_outbound_summary)"
+        printf '1. 使用 v2rayN 分享链接 (vmess/vless/trojan/ss)\n'
+        printf '2. 手动输入 socks5/http 代理链接\n'
+        printf '3. 手动输入完整 outbound JSON\n'
+        printf '4. 继承全局默认出口\n'
+        printf '5. 改为直出\n'
+        printf '6. 测试当前出口配置\n'
+        printf '0. 返回\n请选择: '
+        read -r c 2>/dev/null || c=""
+        case "$c" in
+            1|2)
+                if prompt_outbound_link; then
+                    N_OUT_MODE="custom"
+                    N_OUT_JSON="$OUT_JSON"
+                    N_OUT_LABEL="$OUT_LABEL"
+                    save_node || {
+                        warn "出口保存失败"
+                        continue
+                    }
+                    log_event "node $id outbound set: $N_OUT_LABEL"
+                    if apply_config; then
+                        ok "出口已设置: $N_OUT_LABEL"
+                    else
+                        warn "出口已保存，但配置应用失败，请检查后重试"
+                    fi
+                fi
+                ;;
+            3)
+                body=$(prompt_outbound_json_multiline)
+                [ -n "$body" ] || continue
+                if parse_outbound_any "$body" && outbound_self_test "$OUT_JSON"; then
+                    N_OUT_MODE="custom"
+                    N_OUT_JSON="$OUT_JSON"
+                    N_OUT_LABEL="${OUT_LABEL:-$OUT_KIND}"
+                    save_node || {
+                        warn "出口保存失败"
+                        continue
+                    }
+                    log_event "node $id outbound set: $N_OUT_LABEL"
+                    if apply_config; then
+                        ok "出口已设置: $N_OUT_LABEL"
+                    else
+                        warn "出口已保存，但配置应用失败，请检查后重试"
+                    fi
+                else
+                    err "出口 JSON 未通过校验"
+                    [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+                fi
+                ;;
+            4)
+                N_OUT_MODE="inherit"
+                save_node || {
+                    warn "出口保存失败"
+                    continue
+                }
+                apply_config || warn "配置应用失败"
+                ok "已改为继承全局默认出口"
+                ;;
+            5)
+                N_OUT_MODE="direct"
+                save_node || {
+                    warn "出口保存失败"
+                    continue
+                }
+                apply_config || warn "配置应用失败"
+                ok "已改为直出"
+                ;;
+            6)
+                resolve_node_outbound
+                if [ -z "$R_OUT_JSON" ]; then
+                    printf '当前为直出，无需测试\n'
+                elif outbound_self_test "$R_OUT_JSON"; then
+                    ok "出口配置通过 Xray 校验 ($R_OUT_KIND)"
+                else
+                    err "出口配置未通过校验"
+                    [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+        load_node "$id" || return 1
+        pause
+    done
+}
+
+set_node_outbound_menu() {
+    ask_node_id || return 1
+    set_node_outbound_for_id "$NODE_INPUT"
+}
+
 modify_node() {
     require_xray
     ask_node_id || return 1
@@ -2627,6 +3350,7 @@ modify_node() {
         printf ' 5. 修改指纹        6. 重置 UUID\n'
         printf ' 7. 重置 Reality 密钥  8. 修改备注\n'
         printf ' 9. 查看节点链接   10. 修改外部映射端口\n'
+        printf '11. 设置出口(可经代理中转)\n'
         printf ' 0. 返回\n'
         printf '请选择: '
         read -r c 2>/dev/null || c=""
@@ -2757,6 +3481,9 @@ modify_node() {
                 else
                     warn "请输入 1-65535 之间的端口"
                 fi
+                ;;
+            11)
+                set_node_outbound_for_id "$id"
                 ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -3287,6 +4014,85 @@ remove_cron() {
     cron_restart
 }
 
+set_default_outbound_menu() {
+    while :; do
+        clear_screen
+        printf '%s默认出口（全局）%s\n\n' "$C_BOLD" "$C_NC"
+        printf '当前默认出口: %s\n\n' "${DEFAULT_OUT_LABEL:-未设置(直出)}"
+        printf '说明: 节点出口为「继承全局」时使用此设置。\n\n'
+        printf '1. 使用 v2rayN 分享链接 (vmess/vless/trojan/ss)\n'
+        printf '2. 手动输入 socks5/http 代理链接\n'
+        printf '3. 手动输入完整 outbound JSON\n'
+        printf '4. 测试当前默认出口\n'
+        printf '5. 清除默认出口(直出)\n'
+        printf '0. 返回\n请选择: '
+        read -r c 2>/dev/null || c=""
+        case "$c" in
+            1|2)
+                if prompt_outbound_link; then
+                    DEFAULT_OUT_JSON="$OUT_JSON"
+                    DEFAULT_OUT_LABEL="$OUT_LABEL"
+                    save_settings || {
+                        warn "保存失败"
+                        continue
+                    }
+                    if apply_config; then
+                        ok "默认出口已设置: $DEFAULT_OUT_LABEL"
+                    else
+                        warn "已保存，但配置应用失败，请检查后重试"
+                    fi
+                fi
+                ;;
+            3)
+                body=$(prompt_outbound_json_multiline)
+                [ -n "$body" ] || continue
+                if parse_outbound_any "$body" && outbound_self_test "$OUT_JSON"; then
+                    DEFAULT_OUT_JSON="$OUT_JSON"
+                    DEFAULT_OUT_LABEL="${OUT_LABEL:-$OUT_KIND}"
+                    save_settings || {
+                        warn "保存失败"
+                        continue
+                    }
+                    if apply_config; then
+                        ok "默认出口已设置: $DEFAULT_OUT_LABEL"
+                    else
+                        warn "已保存，但配置应用失败，请检查后重试"
+                    fi
+                else
+                    err "出口 JSON 未通过校验"
+                    [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+                fi
+                ;;
+            4)
+                if [ -z "$DEFAULT_OUT_JSON" ]; then
+                    printf '当前未设置默认出口\n'
+                elif outbound_self_test "$DEFAULT_OUT_JSON"; then
+                    ok "默认出口通过 Xray 校验"
+                else
+                    err "默认出口未通过校验"
+                    [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+                fi
+                ;;
+            5)
+                DEFAULT_OUT_JSON=""
+                DEFAULT_OUT_LABEL=""
+                save_settings || {
+                    warn "保存失败"
+                    continue
+                }
+                if apply_config; then
+                    ok "默认出口已清除"
+                else
+                    warn "已保存，但配置应用失败，请检查后重试"
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+        pause
+    done
+}
+
 global_settings_menu() {
     while :; do
         clear_screen
@@ -3298,6 +4104,7 @@ global_settings_menu() {
         printf '5. 监控间隔(分钟)    : %s\n' "$MONITOR_INTERVAL"
         printf '6. 限速网卡          : %s\n' "$([ -n "$IFACE" ] && printf '%s' "$IFACE" || printf '自动检测')"
         printf '7. 下载代理          : %s\n' "$([ -n "$DOWNLOAD_PROXY" ] && printf '%s' "$DOWNLOAD_PROXY" || printf '未设置')"
+        printf '8. 默认出口          : %s\n' "${DEFAULT_OUT_LABEL:-未设置(直出)}"
         printf '0. 返回\n请选择: '
         read -r c 2>/dev/null || c=""
         case "$c" in
@@ -3364,6 +4171,9 @@ global_settings_menu() {
                 DOWNLOAD_PROXY=$(sanitize_text "$REPLY")
                 save_settings
                 ok "已保存"
+                ;;
+            8)
+                set_default_outbound_menu
                 ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -4012,7 +4822,7 @@ main_menu() {
         printf '21. 备份/恢复                  22. 系统信息/依赖检查\n'
         printf '23. 卸载                       24. 编辑 Xray 配置\n'
         printf '25. 测试节点连通性             26. Reality SNI 检测\n'
-        printf '27. NAT VPS 部署检查\n'
+        printf '27. NAT VPS 部署检查           28. 设置节点出口\n'
         printf '                                   0. 退出\n'
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
@@ -4045,6 +4855,7 @@ main_menu() {
             25) test_nodes; pause ;;
             26) check_sni_candidates; pause ;;
             27) nat_diagnostics; pause ;;
+            28) set_node_outbound_menu; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
