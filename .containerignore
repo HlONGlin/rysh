@@ -1,0 +1,6 @@
+.git
+.gitignore
+.containerignore
+*.md
+compose.yaml
+one-click.sh

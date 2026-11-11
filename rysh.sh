@@ -1,7 +1,7 @@
 #!/bin/sh
 
-RYSH_VERSION="1.0.2"
-RYSH_DIR="/etc/rysh"
+RYSH_VERSION="1.0.5"
+RYSH_DIR="${RYSH_DIR:-/etc/rysh}"
 NODE_DIR="$RYSH_DIR/nodes"
 STATE_DIR="$RYSH_DIR/state"
 HISTORY_DIR="$RYSH_DIR/history"
@@ -9,14 +9,31 @@ SETTINGS_FILE="$RYSH_DIR/settings.conf"
 BLOCKED_FILE="$RYSH_DIR/blocked.ports"
 TC_STATE_FILE="$RYSH_DIR/tc.state"
 EVENT_LOG="$RYSH_DIR/events.log"
-LOCK_DIR="/var/lock/rysh.lock"
+LOCK_DIR="${RYSH_LOCK_DIR:-/var/lock/rysh.lock}"
 MANAGED_MARK="$RYSH_DIR/.managed"
+RYSH_BIN="${RYSH_BIN:-/usr/local/bin/rysh}"
+RYSH_BIN_DIR=${RYSH_BIN%/*}
+[ "$RYSH_BIN_DIR" != "$RYSH_BIN" ] || RYSH_BIN_DIR="."
+RYSH_SHORTCUT_BIN="${RYSH_SHORTCUT_BIN:-$RYSH_BIN_DIR/ry}"
 
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONF_DIR="/usr/local/etc/xray"
+OS_ID=""
+OS_LIKE=""
+OS_NAME=""
+OS_VERSION_ID=""
+OS_PRETTY=""
+PKG_MANAGER=""
+INIT_SYSTEM=""
+CONTAINER_RUNTIME=""
+
+XRAY_BIN="${RYSH_XRAY_BIN:-/usr/local/bin/xray}"
+XRAY_CONF_DIR="${RYSH_XRAY_CONF_DIR:-/usr/local/etc/xray}"
 XRAY_CONF="$XRAY_CONF_DIR/config.json"
-XRAY_ASSET_DIR="/usr/local/share/xray"
-XRAY_LOG_DIR="/var/log/xray"
+XRAY_ASSET_DIR="${RYSH_XRAY_ASSET_DIR:-/usr/local/share/xray}"
+XRAY_LOG_DIR="${RYSH_XRAY_LOG_DIR:-/var/log/xray}"
+XRAY_PID="${RYSH_XRAY_PID_FILE:-/run/xray.pid}"
+SUPERVISOR_STOP_FILE="${RYSH_SUPERVISOR_STOP_FILE:-/run/rysh.supervisor.stop}"
+SUPERVISOR_PAUSE_FILE="${RYSH_SUPERVISOR_PAUSE_FILE:-/run/rysh.supervisor.pause}"
+SNI_DATA_DIR="${RYSH_SNI_DATA_DIR:-/usr/local/share/rysh}"
 API_ADDR="127.0.0.1:10085"
 API_PORT="10085"
 TC_CHAIN="1381589832"
@@ -63,6 +80,96 @@ require_root() {
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+detect_os() {
+    OS_ID="unknown"
+    OS_LIKE=""
+    OS_NAME=$(uname -s 2>/dev/null || printf 'Linux')
+    OS_VERSION_ID=""
+    OS_PRETTY="$OS_NAME"
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        OS_ID=${ID:-unknown}
+        OS_LIKE=${ID_LIKE:-}
+        OS_NAME=${NAME:-$OS_NAME}
+        OS_VERSION_ID=${VERSION_ID:-}
+        if [ -n "${PRETTY_NAME:-}" ]; then
+            OS_PRETTY="$PRETTY_NAME"
+        elif [ -n "$OS_VERSION_ID" ]; then
+            OS_PRETTY="$OS_NAME $OS_VERSION_ID"
+        else
+            OS_PRETTY="$OS_NAME"
+        fi
+    fi
+}
+
+detect_container() {
+    CONTAINER_RUNTIME=""
+    if [ -n "${RYSH_CONTAINER_RUNTIME:-}" ]; then
+        CONTAINER_RUNTIME=$RYSH_CONTAINER_RUNTIME
+    elif [ -f /run/.containerenv ] || [ -f /.containerenv ]; then
+        CONTAINER_RUNTIME="podman"
+    elif [ -f /.dockerenv ]; then
+        CONTAINER_RUNTIME="docker"
+    elif [ -n "${container:-}" ]; then
+        CONTAINER_RUNTIME=$container
+    elif grep -qaE '(docker|podman|libpod|containerd)' /proc/1/cgroup 2>/dev/null; then
+        CONTAINER_RUNTIME="container"
+    fi
+}
+
+container_environment() {
+    [ -n "$CONTAINER_RUNTIME" ]
+}
+
+detect_package_manager() {
+    if [ -n "${RYSH_PKG_MANAGER:-}" ]; then
+        PKG_MANAGER=$RYSH_PKG_MANAGER
+    elif need_cmd apk; then
+        PKG_MANAGER="apk"
+    elif need_cmd apt-get; then
+        PKG_MANAGER="apt"
+    elif need_cmd dnf; then
+        PKG_MANAGER="dnf"
+    elif need_cmd microdnf; then
+        PKG_MANAGER="microdnf"
+    elif need_cmd tdnf; then
+        PKG_MANAGER="tdnf"
+    elif need_cmd yum; then
+        PKG_MANAGER="yum"
+    elif need_cmd zypper; then
+        PKG_MANAGER="zypper"
+    elif need_cmd pacman; then
+        PKG_MANAGER="pacman"
+    elif need_cmd xbps-install; then
+        PKG_MANAGER="xbps"
+    elif need_cmd emerge; then
+        PKG_MANAGER="emerge"
+    else
+        PKG_MANAGER=""
+    fi
+}
+
+os_pretty_name() {
+    if [ -n "$OS_PRETTY" ]; then
+        printf '%s' "$OS_PRETTY"
+    else
+        uname -s 2>/dev/null || printf 'Linux'
+    fi
+}
+
+container_label() {
+    case "$CONTAINER_RUNTIME" in
+        podman) printf 'Podman' ;;
+        docker) printf 'Docker' ;;
+        '') printf '宿主机' ;;
+        *) printf '%s 容器' "$CONTAINER_RUNTIME" ;;
+    esac
+}
+
+package_manager_label() {
+    [ -n "$PKG_MANAGER" ] && printf '%s' "$PKG_MANAGER" || printf '未知'
 }
 
 require_xray() {
@@ -143,64 +250,266 @@ self_install() {
     src="$0"
     if [ -f "$src" ]; then
         abs=$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")
-        if [ "$abs" != "/usr/local/bin/rysh" ]; then
-            cp "$abs" /usr/local/bin/rysh 2>/dev/null && chmod 755 /usr/local/bin/rysh 2>/dev/null
+        if [ "$abs" != "$RYSH_BIN" ]; then
+            cp "$abs" "$RYSH_BIN" 2>/dev/null && chmod 755 "$RYSH_BIN" 2>/dev/null
         fi
-    elif [ -x /usr/local/bin/rysh ]; then
+    elif [ -x "$RYSH_BIN" ]; then
         install_shortcut
         return 0
     fi
-    [ -x /usr/local/bin/rysh ] || warn "请将脚本安装到 /usr/local/bin/rysh，否则定时任务无法运行"
+    [ -x "$RYSH_BIN" ] || warn "请将脚本安装到 $RYSH_BIN，否则定时任务无法运行"
     install_shortcut
 }
 
 install_shortcut() {
-    [ -x /usr/local/bin/rysh ] || return 0
-    if [ -e /usr/local/bin/ry ] || [ -L /usr/local/bin/ry ]; then
-        target=$(readlink /usr/local/bin/ry 2>/dev/null)
-        if [ "$target" = "/usr/local/bin/rysh" ]; then
+    [ -x "$RYSH_BIN" ] || return 0
+    mkdir -p "$RYSH_BIN_DIR" 2>/dev/null || true
+    if [ -e "$RYSH_SHORTCUT_BIN" ] || [ -L "$RYSH_SHORTCUT_BIN" ]; then
+        target=$(readlink "$RYSH_SHORTCUT_BIN" 2>/dev/null)
+        if [ "$target" = "$RYSH_BIN" ]; then
             return 0
         fi
-        if [ -f /usr/local/bin/ry ] && ! [ -L /usr/local/bin/ry ]; then
-            warn "/usr/local/bin/ry 已存在且不是 rysh 的链接，跳过快捷命令创建"
+        if [ -f "$RYSH_SHORTCUT_BIN" ] && ! [ -L "$RYSH_SHORTCUT_BIN" ]; then
+            warn "$RYSH_SHORTCUT_BIN 已存在且不是 rysh 的链接，跳过快捷命令创建"
             return 0
         fi
     fi
-    ln -sf /usr/local/bin/rysh /usr/local/bin/ry 2>/dev/null && return 0
-    cp /usr/local/bin/rysh /usr/local/bin/ry 2>/dev/null && chmod 755 /usr/local/bin/ry 2>/dev/null
+    ln -sf "$RYSH_BIN" "$RYSH_SHORTCUT_BIN" 2>/dev/null && return 0
+    cp "$RYSH_BIN" "$RYSH_SHORTCUT_BIN" 2>/dev/null && chmod 755 "$RYSH_SHORTCUT_BIN" 2>/dev/null
 }
 
 remove_shortcut() {
-    if [ -L /usr/local/bin/ry ]; then
-        rm -f /usr/local/bin/ry
-    elif [ -f /usr/local/bin/ry ]; then
-        cmp -s /usr/local/bin/ry /usr/local/bin/rysh 2>/dev/null && rm -f /usr/local/bin/ry
+    if [ -L "$RYSH_SHORTCUT_BIN" ]; then
+        rm -f "$RYSH_SHORTCUT_BIN"
+    elif [ -f "$RYSH_SHORTCUT_BIN" ]; then
+        cmp -s "$RYSH_SHORTCUT_BIN" "$RYSH_BIN" 2>/dev/null && rm -f "$RYSH_SHORTCUT_BIN"
     fi
 }
 
+pkg_install() {
+    [ "$#" -gt 0 ] || return 0
+    case "$PKG_MANAGER" in
+        apk)
+            apk add --no-cache "$@"
+            ;;
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq "$@"
+            ;;
+        dnf|microdnf|tdnf)
+            "$PKG_MANAGER" install -y "$@"
+            ;;
+        yum)
+            yum install -y "$@"
+            ;;
+        zypper)
+            zypper --non-interactive install "$@"
+            ;;
+        pacman)
+            pacman -Sy --needed --noconfirm "$@"
+            ;;
+        xbps)
+            xbps-install -Sy "$@"
+            ;;
+        emerge)
+            emerge --ask=n --verbose "$@"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+package_for_command() {
+    pkg_cmd=$1
+    case "$PKG_MANAGER" in
+        apk)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip) printf 'iproute2' ;;
+                tc) printf 'iproute2-tc' ;;
+                ss) printf 'iproute2-ss' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'libqrencode-tools' ;;
+            esac
+            ;;
+        apt)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip|tc|ss) printf 'iproute2' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cron' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        dnf|yum|microdnf)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip|ss) printf 'iproute' ;;
+                tc) printf 'iproute-tc' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        tdnf)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip|ss)
+                    case "$OS_ID" in
+                        photon) printf 'iproute2' ;;
+                        *) printf 'iproute' ;;
+                    esac
+                    ;;
+                tc)
+                    case "$OS_ID" in
+                        photon) printf 'iproute2' ;;
+                        *) printf 'iproute-tc' ;;
+                    esac
+                    ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        zypper)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip|tc|ss) printf 'iproute2' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        pacman)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables-nft' ;;
+                ip|tc|ss) printf 'iproute2' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        xbps)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'ca-certificates' ;;
+                curl) printf 'curl' ;;
+                unzip) printf 'unzip' ;;
+                jq) printf 'jq' ;;
+                nft) printf 'nftables' ;;
+                iptables) printf 'iptables' ;;
+                ip|tc|ss) printf 'iproute2' ;;
+                openssl) printf 'openssl' ;;
+                timeout) printf 'coreutils' ;;
+                crontab) printf 'cronie' ;;
+                qrencode) printf 'qrencode' ;;
+            esac
+            ;;
+        emerge)
+            case "$pkg_cmd" in
+                ca-certificates) printf 'app-misc/ca-certificates' ;;
+                curl) printf 'net-misc/curl' ;;
+                unzip) printf 'app-arch/unzip' ;;
+                jq) printf 'dev-lang/jq' ;;
+                nft) printf 'net-firewall/nftables' ;;
+                iptables) printf 'net-firewall/iptables' ;;
+                ip|tc|ss) printf 'sys-apps/iproute2' ;;
+                openssl) printf 'dev-libs/openssl' ;;
+                timeout) printf 'sys-apps/coreutils' ;;
+                crontab) printf 'sys-process/cronie' ;;
+                qrencode) printf 'media-gfx/qrencode' ;;
+            esac
+            ;;
+    esac
+}
+
 ensure_deps() {
+    detect_package_manager
     missing=""
-    for c in curl unzip jq nft tc ss openssl timeout; do
+    for c in curl unzip jq nft iptables tc ss ip openssl timeout; do
         need_cmd "$c" || missing="$missing $c"
     done
+    if ! container_environment; then
+        need_cmd crontab || missing="$missing crontab"
+    fi
     if [ -n "$missing" ]; then
         msg "正在安装依赖:$missing"
-        if need_cmd apk; then
-            apk add --no-cache curl unzip jq nftables iptables iproute2 ca-certificates openssl coreutils >/dev/null 2>&1 || return 1
-            need_cmd tc || apk add --no-cache iproute2-tc >/dev/null 2>&1 || true
-            need_cmd ss || apk add --no-cache iproute2-ss >/dev/null 2>&1 || true
-        elif need_cmd apt-get; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl unzip jq nftables iptables iproute2 ca-certificates cron openssl coreutils >/dev/null 2>&1 || {
-                err "依赖安装失败，请检查网络或软件源"
-                return 1
-            }
-        else
-            err "依赖安装失败，请检查网络或软件源"
+        if [ -z "$PKG_MANAGER" ]; then
+            err "未检测到受支持的软件包管理器，请手动安装:$missing"
             return 1
         fi
+        packages=""
+        for c in $missing; do
+            package=$(package_for_command "$c")
+            [ -n "$package" ] || continue
+            case " $packages " in
+                *" $package "*) ;;
+                *) packages="$packages $package" ;;
+            esac
+        done
+        ca_package=$(package_for_command ca-certificates)
+        if [ -n "$ca_package" ]; then
+            case " $packages " in
+                *" $ca_package "*) ;;
+                *) packages="$packages $ca_package" ;;
+            esac
+        fi
+        if ! pkg_install $packages >/dev/null 2>&1; then
+            warn "批量安装失败，尝试逐项安装缺失组件"
+            for package in $packages; do
+                pkg_install "$package" >/dev/null 2>&1 || true
+            done
+        fi
     fi
-    need_cmd jq || warn "jq 未安装，流量统计可能不可用"
+    for c in curl unzip jq openssl; do
+        need_cmd "$c" || {
+            err "缺少必要依赖: $c"
+            return 1
+        }
+    done
+    for c in nft tc ss ip iptables timeout; do
+        need_cmd "$c" || warn "缺少可选依赖: $c，部分高级功能可能不可用"
+    done
+    if ! container_environment && ! need_cmd crontab; then
+        warn "未安装 crontab，自动限额与到期检查将无法定时执行"
+    fi
     return 0
 }
 
@@ -221,23 +530,32 @@ xray_arch() {
     case "$m" in
         x86_64|amd64) printf '%s' "64" ;;
         aarch64|arm64) printf '%s' "arm64-v8a" ;;
-        armv7l|armv7) printf '%s' "arm32-v7a" ;;
+        armv7l|armv7|armv8l) printf '%s' "arm32-v7a" ;;
         armv6l) printf '%s' "arm32-v6" ;;
+        armv5l|armv5tel) printf '%s' "arm32-v5" ;;
         i386|i686) printf '%s' "32" ;;
         s390x) printf '%s' "s390x" ;;
+        loongarch64|loong64) printf '%s' "loong64" ;;
+        mips|mips32) printf '%s' "mips32" ;;
+        mipsel|mips32el) printf '%s' "mips32le" ;;
+        mips64) printf '%s' "mips64" ;;
+        mips64el) printf '%s' "mips64le" ;;
+        ppc64) printf '%s' "ppc64" ;;
+        ppc64le) printf '%s' "ppc64le" ;;
+        riscv64) printf '%s' "riscv64" ;;
         *) printf '%s' "" ;;
     esac
 }
 
 create_xray_service() {
-    cat > /etc/init.d/xray <<'SERVICE_EOF'
+    cat > /etc/init.d/xray <<SERVICE_EOF
 #!/sbin/openrc-run
 name="xray"
 description="Xray-core service"
-command="/usr/local/bin/xray"
-command_args="run -c /usr/local/etc/xray/config.json"
+command="$XRAY_BIN"
+command_args="run -c $XRAY_CONF"
 command_background="yes"
-pidfile="/run/xray.pid"
+pidfile="$XRAY_PID"
 depend() {
     need net
     after firewall
@@ -247,7 +565,7 @@ SERVICE_EOF
 }
 
 create_rysh_service() {
-    cat > /etc/init.d/rysh <<'SERVICE_EOF'
+    cat > /etc/init.d/rysh <<SERVICE_EOF
 #!/sbin/openrc-run
 description="rysh policy service"
 depend() {
@@ -257,24 +575,82 @@ depend() {
 }
 start() {
     ebegin "Applying rysh policy"
-    /usr/local/bin/rysh apply --quiet
-    eend $?
+    $RYSH_BIN apply --quiet
+    eend \$?
 }
 stop() {
     ebegin "Clearing rysh policy"
-    /usr/local/bin/rysh clear --quiet
-    eend $?
+    $RYSH_BIN clear --quiet
+    eend \$?
 }
 SERVICE_EOF
     chmod 755 /etc/init.d/rysh
 }
 
 openrc_active() {
-    [ -d /run/openrc ] && need_cmd rc-service
+    if [ -d /run/openrc ] && need_cmd rc-service; then
+        return 0
+    fi
+    [ "$(cat /proc/1/comm 2>/dev/null)" = "openrc-init" ] && need_cmd rc-service
 }
 
 systemd_active() {
-    need_cmd systemctl && [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]
+    need_cmd systemctl || return 1
+    [ -d /run/systemd/system ] && return 0
+    [ "$(cat /proc/1/comm 2>/dev/null)" = "systemd" ]
+}
+
+runit_active() {
+    need_cmd sv || return 1
+    case "$(cat /proc/1/comm 2>/dev/null)" in
+        runit|runsvdir) return 0 ;;
+    esac
+    [ -d /run/runit/service ]
+}
+
+sysv_active() {
+    systemd_active && return 1
+    openrc_active && return 1
+    runit_active && return 1
+    container_environment && return 1
+    [ -d /etc/init.d ] && need_cmd service || return 1
+    case "$(cat /proc/1/comm 2>/dev/null)" in
+        init|sysvinit) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_init_system() {
+    if container_environment; then
+        INIT_SYSTEM="process"
+    elif systemd_active; then
+        INIT_SYSTEM="systemd"
+    elif openrc_active; then
+        INIT_SYSTEM="openrc"
+    elif runit_active; then
+        INIT_SYSTEM="runit"
+    elif sysv_active; then
+        INIT_SYSTEM="sysv"
+    else
+        INIT_SYSTEM="process"
+    fi
+}
+
+init_system_name() {
+    case "$INIT_SYSTEM" in
+        systemd) printf 'systemd' ;;
+        openrc) printf 'OpenRC' ;;
+        runit) printf 'runit' ;;
+        sysv) printf 'SysVinit' ;;
+        *) printf '进程模式（无 init）' ;;
+    esac
+}
+
+detect_environment() {
+    detect_os
+    detect_container
+    detect_package_manager
+    detect_init_system
 }
 
 install_xray() {
@@ -331,7 +707,7 @@ install_xray() {
     if [ -x "$XRAY_BIN" ]; then
         cp "$XRAY_BIN" "$XRAY_BIN.bak" 2>/dev/null || true
     fi
-    xray_stop
+    xray_stop update
     if ! mv -f "$candidate" "$XRAY_BIN"; then
         rm -f "$candidate"
         [ -x "$XRAY_BIN.bak" ] && mv "$XRAY_BIN.bak" "$XRAY_BIN"
@@ -357,8 +733,7 @@ install_xray() {
         die "Xray 无法运行，可能是架构不匹配"
     fi
 
-    create_xray_service
-    create_rysh_service
+    register_services
     mkdir -p "$XRAY_LOG_DIR"
 
     if [ -f "$XRAY_CONF" ] && [ ! -f "$MANAGED_MARK" ]; then
@@ -385,14 +760,18 @@ install_xray() {
         fi
     fi
 
-    if openrc_active; then
-        rc-update add xray default >/dev/null 2>&1 || true
-        rc-update add rysh default >/dev/null 2>&1 || true
-    elif systemd_active; then
-        create_systemd_services
-        systemctl daemon-reload
-        systemctl enable rysh.service xray.service >/dev/null 2>&1 || true
+    if container_environment; then
+        rm -f "$SUPERVISOR_PAUSE_FILE" "$SUPERVISOR_STOP_FILE"
+        xray_start
+        if ! wait_xray_start; then
+            err "容器内 Xray 启动失败，请查看 $XRAY_LOG_DIR/error.log"
+            return 1
+        fi
+        [ -n "$(node_ids)" ] && apply_tc_all
+        ok "容器内 Xray 安装完成并由 supervisor 接管: $("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+        return 0
     fi
+
     xray_start
     if ! wait_xray_start; then
         err "Xray 启动失败，请查看 $XRAY_LOG_DIR/error.log"
@@ -404,7 +783,7 @@ install_xray() {
 }
 
 create_systemd_services() {
-    cat > /etc/systemd/system/xray.service <<'SERVICE_EOF'
+    cat > /etc/systemd/system/xray.service <<SERVICE_EOF
 [Unit]
 Description=Xray-core service
 After=network-online.target
@@ -412,14 +791,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
+ExecStart=$XRAY_BIN run -c $XRAY_CONF
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 SERVICE_EOF
-    cat > /etc/systemd/system/rysh.service <<'SERVICE_EOF'
+    cat > /etc/systemd/system/rysh.service <<SERVICE_EOF
 [Unit]
 Description=rysh network policy
 After=network-online.target
@@ -428,12 +807,191 @@ Before=xray.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/rysh apply --quiet
-ExecStop=/usr/local/bin/rysh clear --quiet
+ExecStart=$RYSH_BIN apply --quiet
+ExecStop=$RYSH_BIN clear --quiet
 
 [Install]
 WantedBy=multi-user.target
 SERVICE_EOF
+}
+
+create_sysv_services() {
+    cat > /etc/init.d/xray <<SERVICE_EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          xray
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Xray-core service
+### END INIT INFO
+
+DAEMON="$XRAY_BIN"
+CONFIG="$XRAY_CONF"
+PIDFILE="$XRAY_PID"
+LOGFILE="$XRAY_LOG_DIR/stdout.log"
+
+is_running() {
+    [ -s "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null
+}
+
+start_service() {
+    if is_running; then
+        echo "xray is already running"
+        return 0
+    fi
+    [ -x "\$DAEMON" ] || {
+        echo "xray binary not found" >&2
+        return 1
+    }
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon --start --quiet --background --make-pidfile \
+            --pidfile "\$PIDFILE" --exec "\$DAEMON" -- run -c "\$CONFIG"
+    else
+        mkdir -p "\$(dirname "\$LOGFILE")" 2>/dev/null || true
+        nohup "\$DAEMON" run -c "\$CONFIG" >>"\$LOGFILE" 2>&1 &
+        echo "\$!" > "\$PIDFILE"
+    fi
+    sleep 1
+    is_running
+}
+
+stop_service() {
+    if is_running; then
+        kill "\$(cat "\$PIDFILE")" 2>/dev/null || true
+        i=0
+        while [ "\$i" -lt 10 ] && is_running; do
+            sleep 1
+            i=\$((i + 1))
+        done
+        if is_running; then
+            kill -9 "\$(cat "\$PIDFILE")" 2>/dev/null || true
+        fi
+    fi
+    rm -f "\$PIDFILE"
+}
+
+case "\${1:-}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) stop_service; start_service ;;
+    status)
+        if is_running; then
+            echo "xray is running"
+            exit 0
+        fi
+        echo "xray is stopped"
+        exit 3
+        ;;
+    *) echo "Usage: \$0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac
+SERVICE_EOF
+    cat > /etc/init.d/rysh <<SERVICE_EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          rysh
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: rysh network policy
+### END INIT INFO
+
+MARKER=/run/rysh.policy.active
+RYSH_BIN_VALUE="$RYSH_BIN"
+
+case "\${1:-}" in
+    start)
+        "\$RYSH_BIN_VALUE" apply --quiet || exit \$?
+        touch "\$MARKER"
+        ;;
+    stop)
+        "\$RYSH_BIN_VALUE" clear --quiet || true
+        rm -f "\$MARKER"
+        ;;
+    restart)
+        "\$RYSH_BIN_VALUE" clear --quiet || true
+        "\$RYSH_BIN_VALUE" apply --quiet || exit \$?
+        touch "\$MARKER"
+        ;;
+    status)
+        if [ -f "\$MARKER" ]; then
+            echo "rysh policy is active"
+            exit 0
+        fi
+        echo "rysh policy is inactive"
+        exit 3
+        ;;
+    *) echo "Usage: \$0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac
+SERVICE_EOF
+    chmod 755 /etc/init.d/xray /etc/init.d/rysh
+}
+
+create_runit_services() {
+    mkdir -p /etc/sv/xray /etc/sv/rysh "$XRAY_LOG_DIR"
+    cat > /etc/sv/xray/run <<SERVICE_EOF
+#!/bin/sh
+exec 2>&1
+exec "$XRAY_BIN" run -c "$XRAY_CONF" >>"$XRAY_LOG_DIR/stdout.log"
+SERVICE_EOF
+    cat > /etc/sv/rysh/run <<SERVICE_EOF
+#!/bin/sh
+exec 2>&1
+"$RYSH_BIN" apply --quiet || true
+exec tail -f /dev/null
+SERVICE_EOF
+    cat > /etc/sv/rysh/finish <<SERVICE_EOF
+#!/bin/sh
+"$RYSH_BIN" clear --quiet >/dev/null 2>&1 || true
+SERVICE_EOF
+    chmod 755 /etc/sv/xray/run /etc/sv/rysh/run /etc/sv/rysh/finish
+    rm -f /etc/sv/xray/down /etc/sv/rysh/down
+
+    runit_service_dir=""
+    for runit_service_dir in /var/service /service /run/runit/service; do
+        [ -d "$runit_service_dir" ] && break
+        runit_service_dir=""
+    done
+    [ -n "$runit_service_dir" ] || runit_service_dir="/var/service"
+    mkdir -p "$runit_service_dir"
+    ln -sfn /etc/sv/xray "$runit_service_dir/xray" 2>/dev/null || true
+    ln -sfn /etc/sv/rysh "$runit_service_dir/rysh" 2>/dev/null || true
+}
+
+register_services() {
+    case "$INIT_SYSTEM" in
+        openrc)
+            create_xray_service
+            create_rysh_service
+            rc-update add xray default >/dev/null 2>&1 || true
+            rc-update add rysh default >/dev/null 2>&1 || true
+            ;;
+        systemd)
+            create_systemd_services
+            systemctl daemon-reload
+            systemctl enable rysh.service xray.service >/dev/null 2>&1 || true
+            ;;
+        runit)
+            create_runit_services
+            ;;
+        sysv)
+            create_sysv_services
+            if need_cmd update-rc.d; then
+                update-rc.d xray defaults >/dev/null 2>&1 || true
+                update-rc.d rysh defaults >/dev/null 2>&1 || true
+            elif need_cmd chkconfig; then
+                chkconfig --add xray >/dev/null 2>&1 || true
+                chkconfig --add rysh >/dev/null 2>&1 || true
+                chkconfig xray on >/dev/null 2>&1 || true
+                chkconfig rysh on >/dev/null 2>&1 || true
+            fi
+            ;;
+        *)
+            msg "未检测到可注册的 init 系统，使用进程模式运行"
+            ;;
+    esac
 }
 
 validate_config() {
@@ -451,53 +1009,132 @@ validate_config_verbose() {
 }
 
 xray_start() {
-    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
-        systemctl start xray.service >/dev/null 2>&1 || true
-        return 0
-    fi
-    if openrc_active && [ -x /etc/init.d/xray ]; then
-        rc-service xray start >/dev/null 2>&1 || true
-        return 0
-    fi
-    if [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid)" 2>/dev/null; then
+    rm -f "$SUPERVISOR_PAUSE_FILE"
+    case "$INIT_SYSTEM" in
+        systemd)
+            if [ -f /etc/systemd/system/xray.service ]; then
+                systemctl start xray.service
+                return $?
+            fi
+            ;;
+        openrc)
+            if [ -x /etc/init.d/xray ]; then
+                rc-service xray start >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+        runit)
+            if [ -d /etc/sv/xray ]; then
+                rm -f /etc/sv/xray/down "$SUPERVISOR_STOP_FILE"
+                sv start /etc/sv/xray >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+        sysv)
+            if [ -x /etc/init.d/xray ]; then
+                service xray start >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+    esac
+
+    if [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null; then
         return 0
     fi
     [ -x "$XRAY_BIN" ] || return 1
+    mkdir -p "$XRAY_LOG_DIR" 2>/dev/null || true
+    if container_environment; then
+        rm -f "$SUPERVISOR_STOP_FILE"
+    fi
     nohup "$XRAY_BIN" run -c "$XRAY_CONF" >>"$XRAY_LOG_DIR/stdout.log" 2>&1 &
-    printf '%s' "$!" > /run/xray.pid
+    printf '%s' "$!" > "$XRAY_PID"
+    return 0
 }
 
 xray_stop() {
-    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
-        systemctl stop xray.service >/dev/null 2>&1 || true
-        return 0
+    case "$INIT_SYSTEM" in
+        systemd)
+            if [ -f /etc/systemd/system/xray.service ]; then
+                systemctl stop xray.service >/dev/null 2>&1 || true
+                return 0
+            fi
+            ;;
+        openrc)
+            if [ -x /etc/init.d/xray ]; then
+                rc-service xray stop >/dev/null 2>&1 || true
+                return 0
+            fi
+            ;;
+        runit)
+            if [ -d /etc/sv/xray ]; then
+                touch /etc/sv/xray/down
+                sv stop /etc/sv/xray >/dev/null 2>&1 || true
+                return 0
+            fi
+            ;;
+        sysv)
+            if [ -x /etc/init.d/xray ]; then
+                service xray stop >/dev/null 2>&1 || true
+                return 0
+            fi
+            ;;
+    esac
+
+    if container_environment && [ "${1:-}" != "shutdown" ]; then
+        touch "$SUPERVISOR_PAUSE_FILE"
     fi
-    if openrc_active && [ -x /etc/init.d/xray ]; then
-        rc-service xray stop >/dev/null 2>&1 || true
-        return 0
+    if [ -f "$XRAY_PID" ]; then
+        pid=$(cat "$XRAY_PID" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            i=0
+            while [ "$i" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                i=$((i + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$XRAY_PID"
     fi
-    if [ -f /run/xray.pid ]; then
-        kill "$(cat /run/xray.pid)" 2>/dev/null || true
-        rm -f /run/xray.pid
-    fi
+    return 0
 }
 
 xray_restart() {
-    xray_stop
+    xray_stop || return 1
     sleep 1
     xray_start
 }
 
 xray_running() {
-    if systemd_active && [ -f /etc/systemd/system/xray.service ]; then
-        systemctl is-active --quiet xray.service
-        return $?
-    fi
-    if openrc_active && [ -x /etc/init.d/xray ]; then
-        rc-service xray status >/dev/null 2>&1
-        return $?
-    fi
-    [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid)" 2>/dev/null
+    case "$INIT_SYSTEM" in
+        systemd)
+            if [ -f /etc/systemd/system/xray.service ]; then
+                systemctl is-active --quiet xray.service
+                return $?
+            fi
+            ;;
+        openrc)
+            if [ -x /etc/init.d/xray ]; then
+                rc-service xray status >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+        runit)
+            if [ -d /etc/sv/xray ]; then
+                sv status /etc/sv/xray 2>/dev/null | grep -q '^run:'
+                return $?
+            fi
+            ;;
+        sysv)
+            if [ -x /etc/init.d/xray ]; then
+                service xray status >/dev/null 2>&1
+                return $?
+            fi
+            ;;
+    esac
+    [ -f "$XRAY_PID" ] && kill -0 "$(cat "$XRAY_PID")" 2>/dev/null
 }
 
 wait_xray_start() {
@@ -880,12 +1517,8 @@ build_link() {
 
 gen_config() {
     ensure_dirs
+    printf '{\n  "log": {\n    "loglevel": "warning",\n    "error": "%s"\n  },\n' "$XRAY_LOG_DIR/error.log"
     cat <<'JSON_HEAD'
-{
-  "log": {
-    "loglevel": "warning",
-    "error": "/var/log/xray/error.log"
-  },
   "stats": {},
   "api": {
     "tag": "api",
@@ -1060,7 +1693,7 @@ reset_user_baseline() {
 }
 
 xray_generation() {
-    pid=$(cat /run/xray.pid 2>/dev/null)
+    pid=$(cat "$XRAY_PID" 2>/dev/null)
     if ! is_uint "$pid" || ! kill -0 "$pid" 2>/dev/null; then
         pid=""
         if need_cmd pidof; then
@@ -1286,7 +1919,7 @@ apply_tc_rules() {
     done
     if ! need_cmd tc; then
         if [ "$has_rate" -eq 1 ] || [ -s "$TC_STATE_FILE" ]; then
-            warn "未安装 tc，无法应用限速 (apk add iproute2-tc)"
+            warn "未安装 tc，无法应用限速；请用系统包管理器安装 iproute2/tc"
             return 1
         fi
         return 0
@@ -1512,6 +2145,109 @@ monitor_run() {
         printf '%b\n' "$events"
     fi
     return 0
+}
+
+container_health() {
+    if [ ! -x "$XRAY_BIN" ]; then
+        printf 'unhealthy: Xray 未安装\n'
+        return 1
+    fi
+    if [ -f "$SUPERVISOR_PAUSE_FILE" ]; then
+        printf 'healthy: Xray 已由 rysh 手动暂停\n'
+        return 0
+    fi
+    if xray_running; then
+        printf 'healthy: Xray 运行中\n'
+        return 0
+    fi
+    printf 'unhealthy: Xray 未运行\n'
+    return 1
+}
+
+container_supervisor_run() {
+    require_root
+    ensure_dirs
+    load_settings
+    if ! [ -x "$XRAY_BIN" ]; then
+        msg "未检测到 Xray，正在执行安装..."
+        RYSH_ASSUME_YES=1
+        install_xray || {
+            err "Xray 安装失败，容器 supervisor 无法启动"
+            return 1
+        }
+        load_settings
+    elif ! [ -f "$XRAY_CONF" ] || ! validate_config "$XRAY_CONF"; then
+        msg "Xray 配置缺失或无效，正在本地重新生成..."
+        ensure_dirs
+        touch "$MANAGED_MARK"
+        tmp_cfg="$XRAY_CONF.tmp.$$.json"
+        if gen_config > "$tmp_cfg" && validate_config_verbose "$tmp_cfg"; then
+            chmod 600 "$tmp_cfg"
+            if ! mv "$tmp_cfg" "$XRAY_CONF"; then
+                rm -f "$tmp_cfg"
+                err "写入 Xray 配置失败"
+                return 1
+            fi
+        else
+            rm -f "$tmp_cfg"
+            warn "本地重建配置失败，尝试重新安装 Xray"
+            RYSH_ASSUME_YES=1
+            install_xray || {
+                err "Xray 安装失败，容器 supervisor 无法启动"
+                return 1
+            }
+            load_settings
+        fi
+    fi
+
+    SUPERVISOR_ACTIVE=1
+    trap 'SUPERVISOR_ACTIVE=0' INT TERM HUP
+    rm -f "$SUPERVISOR_STOP_FILE"
+    msg "rysh supervisor 已启动: $RYSH_VERSION ($(container_label))"
+
+    last_monitor=0
+    if ! [ -f "$SUPERVISOR_PAUSE_FILE" ]; then
+        xray_start || warn "Xray 启动失败，稍后重试"
+        if wait_xray_start; then
+            [ -n "$(node_ids)" ] && apply_tc_all
+            (monitor_run --quiet) || warn "流量监控执行失败，将在下个周期重试"
+            last_monitor=$(date +%s 2>/dev/null || printf '0')
+        fi
+    fi
+    while [ "$SUPERVISOR_ACTIVE" -eq 1 ]; do
+        if [ -f "$SUPERVISOR_STOP_FILE" ]; then
+            msg "检测到 supervisor 停止标记，准备退出"
+            break
+        fi
+
+        if [ -f "$SUPERVISOR_PAUSE_FILE" ]; then
+            :
+        elif ! xray_running; then
+            warn "Xray 未运行，正在拉起"
+            xray_start || warn "Xray 启动失败，稍后重试"
+        fi
+
+        now=$(date +%s 2>/dev/null || printf '0')
+        if ! [ -f "$SUPERVISOR_PAUSE_FILE" ] && [ "$now" -gt 0 ]; then
+            monitor_seconds=$((MONITOR_INTERVAL * 60))
+            if [ "$last_monitor" -eq 0 ] || [ $((now - last_monitor)) -ge "$monitor_seconds" ]; then
+                (monitor_run --quiet) || warn "流量监控执行失败，将在下个周期重试"
+                last_monitor=$now
+            fi
+        fi
+
+        elapsed=0
+        while [ "$SUPERVISOR_ACTIVE" -eq 1 ] && [ "$elapsed" -lt 5 ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+    done
+
+    trap - INT TERM HUP
+    xray_stop shutdown
+    clear_all
+    rm -f "$SUPERVISOR_STOP_FILE"
+    msg "rysh supervisor 已退出"
 }
 
 prompt_default() {
@@ -1839,10 +2575,9 @@ show_link_menu() {
         read -r ans 2>/dev/null || ans=""
         case "$ans" in
             y|Y)
-                if ! need_cmd qrencode && need_cmd apk; then
-                    apk add --no-cache qrencode >/dev/null 2>&1 || warn "二维码安装失败"
-                elif ! need_cmd qrencode && need_cmd apt-get; then
-                    apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "二维码安装失败"
+                if ! need_cmd qrencode; then
+                    qr_package=$(package_for_command qrencode)
+                    [ -n "$qr_package" ] && pkg_install "$qr_package" >/dev/null 2>&1 || warn "二维码安装失败"
                 fi
                 if need_cmd qrencode; then
                     qrencode -t ANSIUTF8 "$link" 2>/dev/null || warn "二维码生成失败"
@@ -2371,47 +3106,177 @@ xray_status_log() {
     else
         printf 'Xray 版本: 未安装\n'
     fi
-        printf '运行状态: %s\n' "$(xray_status_text)"
-    if openrc_active; then
-        printf '服务状态: %s\n' "$(rc-service xray status 2>&1 | head -n 1)"
-    elif systemd_active; then
-        printf '服务状态: %s\n' "$(systemctl is-active xray.service 2>/dev/null || true)"
-    fi
+    printf '运行状态: %s\n' "$(xray_status_text)"
+    case "$INIT_SYSTEM" in
+        systemd)
+            printf '服务状态: %s\n' "$(systemctl is-active xray.service 2>/dev/null || true)"
+            ;;
+        openrc)
+            printf '服务状态: %s\n' "$(rc-service xray status 2>&1 | head -n 1)"
+            ;;
+        runit)
+            printf '服务状态: %s\n' "$(sv status /etc/sv/xray 2>&1 | head -n 1)"
+            ;;
+        sysv)
+            printf '服务状态: %s\n' "$(service xray status 2>&1 | head -n 1)"
+            ;;
+        *)
+            if container_environment; then
+                printf '运行方式: %s 容器入口托管\n' "$(container_label)"
+            else
+                printf '运行方式: 进程模式\n'
+            fi
+            ;;
+    esac
     printf '\n%s最近错误日志%s\n' "$C_BOLD" "$C_NC"
     tail -n 30 "$XRAY_LOG_DIR/error.log" 2>/dev/null || printf '暂无日志\n'
     printf '\n%s最近事件日志%s\n' "$C_BOLD" "$C_NC"
     tail -n 20 "$EVENT_LOG" 2>/dev/null || printf '暂无事件\n'
 }
 
-install_cron() {
-    [ -n "$MONITOR_INTERVAL" ] || MONITOR_INTERVAL="1"
-    if systemd_active; then
-        current=$(crontab -l 2>/dev/null || true)
-        updated=$(printf '%s\n' "$current" | grep -v 'rysh monitor' || true)
-        updated=$(printf '%s\n%s' "$updated" "*/$MONITOR_INTERVAL * * * * /usr/local/bin/rysh monitor --quiet >/dev/null 2>&1")
-        printf '%s\n' "$updated" | crontab -
-        systemctl enable --now cron.service >/dev/null 2>&1 || systemctl enable --now crond.service >/dev/null 2>&1 || true
-        ok "监控定时任务已安装 (每 $MONITOR_INTERVAL 分钟)"
+cron_enable() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            for unit in cron.service crond.service cronie.service; do
+                if systemctl enable --now "$unit" >/dev/null 2>&1; then
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        openrc)
+            rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1 || true
+            rc-service crond restart >/dev/null 2>&1 || rc-service cron restart >/dev/null 2>&1 ||                 rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
+            ;;
+        runit)
+            sv start crond >/dev/null 2>&1 || sv start cron >/dev/null 2>&1 || \
+                sv start /etc/sv/crond >/dev/null 2>&1 || sv start /etc/sv/cron >/dev/null 2>&1 || true
+            ;;
+        sysv)
+            service cron restart >/dev/null 2>&1 || service crond restart >/dev/null 2>&1 ||                 service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+            ;;
+        *)
+            if need_cmd crond; then
+                crond -b >/dev/null 2>&1 || true
+            elif need_cmd cron; then
+                cron >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+    return 0
+}
+
+cron_restart() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            for unit in cron.service crond.service cronie.service; do
+                if systemctl is-enabled "$unit" >/dev/null 2>&1; then
+                    systemctl restart "$unit" >/dev/null 2>&1 || true
+                    return 0
+                fi
+            done
+            ;;
+        openrc)
+            rc-service crond restart >/dev/null 2>&1 || rc-service cron restart >/dev/null 2>&1 || true
+            ;;
+        runit)
+            sv restart crond >/dev/null 2>&1 || sv restart cron >/dev/null 2>&1 || true
+            ;;
+        sysv)
+            service cron restart >/dev/null 2>&1 || service crond restart >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+cron_status_text() {
+    if container_environment; then
+        printf '容器内置循环'
         return 0
     fi
-    [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
-    touch /etc/crontabs/root
-    self_install
-    tmp=$(mktemp 2>/dev/null) || tmp="/etc/crontabs/root.tmp.$$"
-    grep -v 'rysh monitor' /etc/crontabs/root > "$tmp" 2>/dev/null || true
-    printf '*/%s * * * * /usr/local/bin/rysh monitor --quiet >/dev/null 2>&1\n' "$MONITOR_INTERVAL" >> "$tmp"
-    mv "$tmp" /etc/crontabs/root
-    chmod 600 /etc/crontabs/root
-    if openrc_active; then
-        rc-update add crond default >/dev/null 2>&1 || true
-        rc-service crond restart >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl is-active cron.service 2>/dev/null ||                 systemctl is-active crond.service 2>/dev/null ||                 systemctl is-active cronie.service 2>/dev/null || printf 'unknown'
+            ;;
+        openrc)
+            rc-service crond status 2>&1 | head -n 1
+            ;;
+        runit)
+            cron_out=$(sv status crond 2>&1) || cron_out=$(sv status cron 2>&1) || cron_out="unknown"
+            printf '%s\n' "$cron_out" | head -n 1
+            ;;
+        sysv)
+            service cron status 2>&1 | head -n 1
+            ;;
+        *)
+            if need_cmd crond && pgrep -x crond >/dev/null 2>&1; then
+                printf 'running'
+            elif need_cmd cron && pgrep -x cron >/dev/null 2>&1; then
+                printf 'running'
+            else
+                printf 'unknown'
+            fi
+            ;;
+    esac
+}
+
+cron_entry_count() {
+    if container_environment; then
+        printf '1'
+        return 0
     fi
+    if need_cmd crontab; then
+        count=$(crontab -l 2>/dev/null | grep -c 'rysh monitor')
+    elif [ -f /etc/crontabs/root ]; then
+        count=$(grep -c 'rysh monitor' /etc/crontabs/root 2>/dev/null)
+    else
+        count=0
+    fi
+    [ -n "$count" ] || count=0
+    printf '%s' "$count"
+}
+
+install_cron() {
+    [ -n "$MONITOR_INTERVAL" ] || MONITOR_INTERVAL="1"
+    if container_environment; then
+        msg "容器内由入口脚本循环执行监控，无需 cron"
+        return 0
+    fi
+    self_install
+
+    if need_cmd crontab; then
+        current=$(crontab -l 2>/dev/null || true)
+        updated=$(printf '%s\n' "$current" | grep -v 'rysh monitor' || true)
+        updated=$(printf '%s\n%s' "$updated" "*/$MONITOR_INTERVAL * * * * $RYSH_BIN monitor --quiet >/dev/null 2>&1")
+        if ! printf '%s\n' "$updated" | crontab -; then
+            err "写入 crontab 失败"
+            return 1
+        fi
+    elif [ -d /etc/crontabs ] || [ "$OS_ID" = "alpine" ]; then
+        [ -d /etc/crontabs ] || mkdir -p /etc/crontabs
+        touch /etc/crontabs/root
+        tmp=$(mktemp 2>/dev/null) || tmp="/etc/crontabs/root.tmp.$$"
+        grep -v 'rysh monitor' /etc/crontabs/root > "$tmp" 2>/dev/null || true
+        printf '*/%s * * * * %s monitor --quiet >/dev/null 2>&1\n' "$MONITOR_INTERVAL" "$RYSH_BIN" >> "$tmp"
+        mv "$tmp" /etc/crontabs/root
+        chmod 600 /etc/crontabs/root
+    else
+        err "未找到 crontab，请先安装 cron/cronie 后重试"
+        return 1
+    fi
+
+    cron_enable
     ok "监控定时任务已安装 (每 $MONITOR_INTERVAL 分钟)"
 }
 
 remove_cron() {
-    if systemd_active; then
-        crontab -l 2>/dev/null | grep -v 'rysh monitor' | crontab - 2>/dev/null || true
+    if container_environment; then
+        return 0
+    fi
+    if need_cmd crontab; then
+        current=$(crontab -l 2>/dev/null || true)
+        updated=$(printf '%s\n' "$current" | grep -v 'rysh monitor' || true)
+        printf '%s\n' "$updated" | crontab - 2>/dev/null || true
+        cron_restart
         return 0
     fi
     [ -f /etc/crontabs/root ] || return 0
@@ -2419,9 +3284,7 @@ remove_cron() {
     grep -v 'rysh monitor' /etc/crontabs/root > "$tmp" 2>/dev/null || true
     mv "$tmp" /etc/crontabs/root
     chmod 600 /etc/crontabs/root
-    if openrc_active; then
-        rc-service crond restart >/dev/null 2>&1 || true
-    fi
+    cron_restart
 }
 
 global_settings_menu() {
@@ -2515,8 +3378,14 @@ backup_config() {
     out="/root/rysh-backup-$ts.tar.gz"
     list=$(mktemp 2>/dev/null) || list="$RYSH_DIR/.backup.list.$$"
     : > "$list"
-    for p in etc/rysh usr/local/etc/xray/config.json etc/init.d/xray etc/init.d/rysh etc/crontabs/root; do
-        [ -e "/$p" ] && printf '%s\n' "$p" >> "$list"
+    for p in "$RYSH_DIR" "$XRAY_CONF" /etc/init.d/xray /etc/init.d/rysh \
+        /etc/systemd/system/xray.service /etc/systemd/system/rysh.service \
+        /etc/sv/xray /etc/sv/rysh /etc/crontabs/root; do
+        case "$p" in
+            /*) rel=${p#/} ;;
+            *) continue ;;
+        esac
+        [ -e "$p" ] && printf '%s\n' "$rel" >> "$list"
     done
     if tar czf "$out" -C / -T "$list" 2>/dev/null; then
         rm -f "$list"
@@ -2581,7 +3450,9 @@ backup_menu() {
 
 system_info() {
     printf '%s系统信息%s\n\n' "$C_BOLD" "$C_NC"
-    printf '系统版本 : %s\n' "$(cat /etc/alpine-release 2>/dev/null || uname -s)"
+    printf '系统版本 : %s\n' "$(os_pretty_name)"
+    printf '运行环境 : %s / %s\n' "$(container_label)" "$(init_system_name)"
+    printf '包管理器 : %s\n' "$(package_manager_label)"
     printf '内核     : %s\n' "$(uname -r)"
     printf '架构     : %s\n' "$(uname -m)"
     printf '公网 IP  : %s\n' "$(get_public_ip)"
@@ -2592,19 +3463,17 @@ system_info() {
     fi
     printf 'Xray状态 : %s\n' "$(xray_status_text)"
     printf '节点数量 : %s\n' "$(node_ids | wc -l | tr -d ' ')"
-    if systemd_active; then
-        cron_count=$(crontab -l 2>/dev/null | grep -c 'rysh monitor')
+    if container_environment; then
+        printf '监控任务 : 容器内置循环\n'
     else
-        cron_count=$(grep -c 'rysh monitor' /etc/crontabs/root 2>/dev/null)
+        printf '监控任务 : %s\n' "$(cron_entry_count)"
     fi
-    [ -n "$cron_count" ] || cron_count=0
-    printf '监控任务 : %s\n' "$cron_count"
     printf '磁盘 /   : %s\n' "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
     printf 'inode /  : %s\n' "$(df -i / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
     if need_cmd free; then
         printf '内存     : %s\n' "$(free -h 2>/dev/null | awk '/^Mem:/{print $3" / "$2}')"
     fi
-    printf 'init     : %s\n' "$(if systemd_active; then printf 'systemd'; elif openrc_active; then printf 'OpenRC'; else printf '未知/容器'; fi)"
+    printf 'init     : %s\n' "$(init_system_name)"
     printf '\n%s依赖检查%s\n\n' "$C_BOLD" "$C_NC"
     for c in curl wget unzip jq nft tc ss iptables qrencode openssl timeout; do
         if need_cmd "$c"; then
@@ -2640,7 +3509,7 @@ nat_diagnostics() {
     printf '公网地址 : %s\n' "$(get_public_ip)"
     printf '本机地址 : %s\n' "$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}')"
     printf '默认路由 : %s\n' "$(ip route show default 2>/dev/null | head -n 1)"
-    printf '服务管理 : %s\n' "$(if systemd_active; then printf 'systemd'; elif openrc_active; then printf 'OpenRC'; else printf '非标准 init/容器'; fi)"
+    printf '服务管理 : %s / %s\n' "$(init_system_name)" "$(container_label)"
     printf 'Xray 状态: %s\n' "$(xray_status_text)"
     printf 'SSH 监听 : '
     if need_cmd ss; then
@@ -2668,8 +3537,6 @@ nat_diagnostics() {
         "$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')" \
         "$(df -i / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')"
 }
-
-SNI_DATA_DIR="/usr/local/share/rysh"
 
 sni_host_region() {
     awk -F '\t' -v host="$1" '$1==host {print $3; exit}' "$SNI_DATA_DIR/sni-candidates.tsv" 2>/dev/null
@@ -2823,48 +3690,90 @@ check_sni_candidates() {
 }
 
 service_start() {
-    if systemd_active; then
-        systemctl start rysh.service xray.service
-        wait_xray_start
-        return $?
-    fi
-    if openrc_active; then
-        rc-service rysh start >/dev/null 2>&1 || true
-        rc-service xray start >/dev/null 2>&1 || true
-        wait_xray_start
-        return $?
-    fi
-    xray_start
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl start rysh.service xray.service || return 1
+            wait_xray_start
+            return $?
+            ;;
+        openrc)
+            rc-service rysh start >/dev/null 2>&1 || true
+            rc-service xray start >/dev/null 2>&1 || true
+            wait_xray_start
+            return $?
+            ;;
+        runit)
+            rm -f /etc/sv/rysh/down
+            sv start /etc/sv/rysh >/dev/null 2>&1 || true
+            xray_start || return 1
+            wait_xray_start
+            return $?
+            ;;
+        sysv)
+            service rysh start >/dev/null 2>&1 || true
+            service xray start >/dev/null 2>&1 || true
+            wait_xray_start
+            return $?
+            ;;
+    esac
+    xray_start || return 1
     apply_tc_all
     monitor_run --quiet
     wait_xray_start
 }
 
 service_stop() {
-    if systemd_active; then
-        systemctl stop xray.service rysh.service >/dev/null 2>&1 || true
-        return 0
-    fi
-    if openrc_active; then
-        rc-service xray stop >/dev/null 2>&1 || true
-        rc-service rysh stop >/dev/null 2>&1 || true
-        return 0
-    fi
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl stop xray.service rysh.service >/dev/null 2>&1 || true
+            return 0
+            ;;
+        openrc)
+            rc-service xray stop >/dev/null 2>&1 || true
+            rc-service rysh stop >/dev/null 2>&1 || true
+            return 0
+            ;;
+        runit)
+            xray_stop
+            touch /etc/sv/rysh/down
+            sv stop /etc/sv/rysh >/dev/null 2>&1 || true
+            return 0
+            ;;
+        sysv)
+            service xray stop >/dev/null 2>&1 || true
+            service rysh stop >/dev/null 2>&1 || true
+            return 0
+            ;;
+    esac
     xray_stop
     clear_all
 }
 
 service_status() {
+    printf '环境  : %s / %s / %s\n' "$(os_pretty_name)" "$(container_label)" "$(init_system_name)"
     printf 'Xray  : %s\n' "$(xray_status_text)"
-    if systemd_active; then
-        printf 'rysh  : %s\n' "$(systemctl is-active rysh.service 2>/dev/null || true)"
-        printf 'cron  : %s\n' "$(systemctl is-active cron.service 2>/dev/null || systemctl is-active crond.service 2>/dev/null || true)"
-        return 0
-    fi
-    if openrc_active; then
-        printf 'rysh  : %s\n' "$(rc-service rysh status 2>&1 | head -n 1)"
-        printf 'crond : %s\n' "$(rc-service crond status 2>&1 | head -n 1)"
-    fi
+    case "$INIT_SYSTEM" in
+        systemd)
+            printf 'rysh  : %s\n' "$(systemctl is-active rysh.service 2>/dev/null || true)"
+            ;;
+        openrc)
+            printf 'rysh  : %s\n' "$(rc-service rysh status 2>&1 | head -n 1)"
+            ;;
+        runit)
+            printf 'rysh  : %s\n' "$(sv status /etc/sv/rysh 2>&1 | head -n 1)"
+            ;;
+        sysv)
+            printf 'rysh  : %s\n' "$(service rysh status 2>&1 | head -n 1)"
+            ;;
+        *)
+            if container_environment; then
+                printf 'rysh  : 容器托管\n'
+            else
+                printf 'rysh  : 进程模式\n'
+            fi
+            ;;
+    esac
+    printf 'cron  : %s\n' "$(cron_status_text)"
 }
 
 reset_all_credentials() {
@@ -2933,39 +3842,83 @@ reset_all_credentials() {
 
 uninstall_keep_config() {
     remove_cron
-    if openrc_active; then
-        rc-service rysh stop >/dev/null 2>&1 || true
-        rc-update del rysh default >/dev/null 2>&1 || true
-    fi
-    if systemd_active; then
-        systemctl disable --now rysh.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/rysh.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
+    case "$INIT_SYSTEM" in
+        openrc)
+            rc-service rysh stop >/dev/null 2>&1 || true
+            rc-update del rysh default >/dev/null 2>&1 || true
+            ;;
+        runit)
+            touch /etc/sv/rysh/down 2>/dev/null || true
+            sv stop /etc/sv/rysh >/dev/null 2>&1 || true
+            for service_dir in /var/service /service /run/runit/service; do
+                rm -f "$service_dir/rysh"
+            done
+            rm -rf /etc/sv/rysh
+            ;;
+        systemd)
+            systemctl disable --now rysh.service >/dev/null 2>&1 || true
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        sysv)
+            service rysh stop >/dev/null 2>&1 || true
+            if need_cmd update-rc.d; then
+                update-rc.d -f rysh remove >/dev/null 2>&1 || true
+            elif need_cmd chkconfig; then
+                chkconfig rysh off >/dev/null 2>&1 || true
+                chkconfig --del rysh >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
     clear_all
     remove_shortcut
-    rm -f /etc/init.d/rysh /usr/local/bin/rysh
+    rm -f /etc/init.d/rysh /etc/systemd/system/rysh.service "$RYSH_BIN"
     rm -f "$SNI_DATA_DIR/sni-candidates.tsv" "$SNI_DATA_DIR/sni-risk-suffixes.txt"
     rmdir "$SNI_DATA_DIR" 2>/dev/null || true
     ok "rysh 已卸载，配置保留在 $RYSH_DIR"
 }
 
 purge_all() {
+    case "$RYSH_DIR" in
+        ''|/) die "RYSH_DIR 不安全，拒绝执行清理" ;;
+    esac
     remove_cron
     xray_stop
-    if openrc_active; then
-        rc-update del xray default >/dev/null 2>&1 || true
-        rc-update del rysh default >/dev/null 2>&1 || true
-        rc-service rysh stop >/dev/null 2>&1 || true
-    fi
-    if systemd_active; then
-        systemctl disable --now xray.service rysh.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/xray.service /etc/systemd/system/rysh.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
+    case "$INIT_SYSTEM" in
+        openrc)
+            rc-update del xray default >/dev/null 2>&1 || true
+            rc-update del rysh default >/dev/null 2>&1 || true
+            rc-service rysh stop >/dev/null 2>&1 || true
+            ;;
+        runit)
+            touch /etc/sv/xray/down 2>/dev/null || true
+            sv stop /etc/sv/xray >/dev/null 2>&1 || true
+            touch /etc/sv/rysh/down 2>/dev/null || true
+            sv stop /etc/sv/rysh >/dev/null 2>&1 || true
+            for service_dir in /var/service /service /run/runit/service; do
+                rm -f "$service_dir/xray" "$service_dir/rysh"
+            done
+            rm -rf /etc/sv/xray /etc/sv/rysh
+            ;;
+        systemd)
+            systemctl disable --now xray.service rysh.service >/dev/null 2>&1 || true
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        sysv)
+            service rysh stop >/dev/null 2>&1 || true
+            if need_cmd update-rc.d; then
+                update-rc.d -f xray remove >/dev/null 2>&1 || true
+                update-rc.d -f rysh remove >/dev/null 2>&1 || true
+            elif need_cmd chkconfig; then
+                chkconfig xray off >/dev/null 2>&1 || true
+                chkconfig rysh off >/dev/null 2>&1 || true
+                chkconfig --del xray >/dev/null 2>&1 || true
+                chkconfig --del rysh >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
     clear_all
     remove_shortcut
-    rm -f /etc/init.d/xray /etc/init.d/rysh /usr/local/bin/xray /usr/local/bin/xray.bak /usr/local/bin/rysh
+    rm -f /etc/init.d/xray /etc/init.d/rysh         /etc/systemd/system/xray.service /etc/systemd/system/rysh.service         "$XRAY_BIN" "$XRAY_BIN.bak" "$RYSH_BIN"
     rm -rf "$RYSH_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR" "$SNI_DATA_DIR"
     ok "完全卸载完成"
 }
@@ -3038,9 +3991,10 @@ main_menu() {
             esac
         done
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
-        printf '%s rysh %s - Xray Reality 多节点管理 (Alpine Linux)%s\n' "$C_BOLD" "$RYSH_VERSION" "$C_NC"
-        printf ' 系统: %s | 节点: %s | Xray: %s | 本月总流量: %s\n' \
-            "$(cat /etc/alpine-release 2>/dev/null || printf '未知')" "$node_count" "$(xray_status_text)" "$(human_bytes "$month_total")"
+        printf '%s rysh %s - Xray Reality 多节点管理%s\n' "$C_BOLD" "$RYSH_VERSION" "$C_NC"
+        printf ' 系统: %s | %s / %s\n' "$(os_pretty_name)" "$(container_label)" "$(init_system_name)"
+        printf ' 节点: %s | Xray: %s | 本月总流量: %s\n' \
+            "$node_count" "$(xray_status_text)" "$(human_bytes "$month_total")"
         printf ' 节点状态: %s正常 %s%s待处理 %s%s已禁用%s\n' \
             "$C_GREEN" "$healthy_count" "$C_NC" "$C_YELLOW" "$attention_count" "$C_NC"
         printf '           %s%s已禁用%s\n' "$C_RED" "$disabled_count" "$C_NC"
@@ -3099,7 +4053,7 @@ main_menu() {
 
 usage() {
     cat <<'USAGE_EOF'
-rysh - Xray Reality 多节点管理脚本 (Alpine Linux)
+rysh - Xray Reality 多节点管理脚本（跨发行版 / Podman）
 
 用法:
   ry                       进入交互菜单（rysh 的快捷命令）
@@ -3112,6 +4066,8 @@ rysh - Xray Reality 多节点管理脚本 (Alpine Linux)
   rysh list                列出节点
   rysh start|stop|restart  启动/停止/重启服务
   rysh status              查看服务状态与日志
+  rysh serve               前台运行容器 supervisor（容器入口使用）
+  rysh health              容器健康检查
   rysh reset-credentials   重置全部节点凭据（保留节点数据）
   rysh uninstall [--purge] [--yes]
                            卸载 rysh；--purge 同时删除 Xray 与全部数据
@@ -3124,6 +4080,8 @@ assume_yes_arg() {
         -y|--yes|-f|--force) RYSH_ASSUME_YES=1 ;;
     esac
 }
+
+detect_environment
 
 case "${1:-}" in
     ''|-m|menu)
@@ -3204,6 +4162,12 @@ case "${1:-}" in
         require_root
         load_settings
         service_status
+        ;;
+    serve|supervisor)
+        container_supervisor_run
+        ;;
+    health)
+        container_health
         ;;
     reset-credentials)
         require_root

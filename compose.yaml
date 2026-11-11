@@ -1,0 +1,34 @@
+services:
+  rysh:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: ${RYSH_IMAGE:-localhost/rysh:latest}
+    container_name: rysh
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    stop_grace_period: 30s
+    volumes:
+      - rysh-config:/etc/rysh
+      - xray-config:/usr/local/etc/xray
+      - xray-bin:/usr/local/xray
+      - xray-assets:/usr/local/share/xray
+      - rysh-sni-data:/usr/local/share/rysh
+      - xray-logs:/var/log/xray
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rysh", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+volumes:
+  rysh-config:
+  xray-config:
+  xray-bin:
+  xray-assets:
+  rysh-sni-data:
+  xray-logs:

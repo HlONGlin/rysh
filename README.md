@@ -2,10 +2,11 @@
 
 ## 一键脚本
 
-直接使用项目提供的一键脚本完成 rysh 的安装与管理：
+直接使用项目提供的一键脚本完成 rysh 的安装与管理。脚本使用 POSIX `sh`，不要求系统预装 Bash：
 
 ```sh
-bash <(curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh)
+curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh -o /tmp/rysh-oneclick.sh
+sh /tmp/rysh-oneclick.sh
 ```
 
 脚本提供数字菜单：
@@ -20,7 +21,7 @@ bash <(curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh)
 
 如果想完全清除后重新开始，在一键管理工具中选择 `4`，并输入 `DELETE` 确认。该操作会删除 rysh、Xray、全部节点配置、流量记录、限速与防火墙规则；清除后重新选择 `1` 安装即可。
 
-脚本会从本项目 `main` 分支下载 `rysh.sh`，安装到 `/usr/local/bin/rysh`，并自动完成依赖安装、Xray 核心安装、系统服务注册和 cron 监控任务创建。Alpine 使用 OpenRC，Debian 使用 systemd。安装完成后选择 `6` 进入节点管理菜单，即可创建第一个 Reality 节点。
+脚本会从本项目 `main` 分支下载 `rysh.sh`，安装到 `/usr/local/bin/rysh`，并自动识别发行版、软件包管理器、容器运行时和 init 系统，完成依赖安装、Xray 核心安装、服务注册和监控任务创建。安装完成后选择 `6` 进入节点管理菜单，即可创建第一个 Reality 节点。
 
 部署完成后，在任意目录输入 **`ry`** 即可直接唤出面板（脚本会自动创建 `/usr/local/bin/ry` 快捷命令，等价于 `rysh`）：
 
@@ -29,18 +30,6 @@ ry
 ```
 
 rysh 没有 Web 面板，也没有管理员账号。菜单 `5` 对应的是**重置全部节点的 UUID、ShortID 与 Reality 密钥**：节点记录、端口、限额、到期时间和流量统计都会保留，但旧客户端链接会立即失效，需要重新导入。只重置单个节点，可以进入菜单 `6` 后使用「修改节点」。
-
-Alpine 最小系统默认没有 `bash`，而 `bash <(...)` 需要 bash 才能执行，请先安装：
-
-```sh
-apk add bash curl ca-certificates
-```
-
-也可以不使用 bash：
-
-```sh
-curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh -o /tmp/rysh-oneclick.sh && sh /tmp/rysh-oneclick.sh
-```
 
 如果提示没有 `curl` 或 `wget`，请先安装：
 
@@ -56,11 +45,23 @@ dnf install -y curl wget
 
 # CentOS / Rocky / AlmaLinux / Oracle Linux / Amazon Linux
 yum install -y curl wget
+
+# openSUSE
+zypper install -y curl wget
+
+# Arch Linux / Manjaro
+pacman -S --needed curl wget
+
+# Void Linux
+xbps-install -Sy curl wget
+
+# Gentoo
+emerge --ask=n net-misc/curl net-misc/wget
 ```
 
 ## 特性
 
-- **一键部署**：自动安装依赖、Xray 核心、OpenRC/systemd 服务与监控任务。
+- **一键部署**：自动安装依赖、Xray 核心、systemd/OpenRC/runit/SysV 服务与监控任务。
 - **多节点**：单机创建任意数量的 VLESS Reality 节点，每个节点独立监听端口、外部映射端口、UUID、Reality 密钥、ShortID、SNI 和目标地址。
 - **批量创建**：一次生成多个节点，自动分配空闲端口，统一设置 SNI、限额、到期和限速。
 - **流量统计**：通过 Xray Stats API 按节点统计上下行流量，重启不丢量，支持本月与历史月份。
@@ -70,26 +71,43 @@ yum install -y curl wget
 - **自动封禁**：使用 nftables 独立表阻断超限端口，失败时回退 iptables。
 - **实时监控**：终端内查看每个节点的实时上下行速率。
 - **链接管理**：查看 VLESS 分享链接、终端二维码，导出全部链接和 Base64 订阅。
-- **轻量**：POSIX `sh` 编写，无 Docker、无外部数据库、无 Web 面板。
+- **跨发行版**：支持主流包管理器和 init 系统；也可在 rootful Podman / Docker 容器中运行。
+- **轻量**：POSIX `sh` 编写，无外部数据库、无 Web 面板。
 
-## 系统要求
+## 系统兼容性
 
-- **Alpine Linux v3.21**（OpenRC）或 **Debian 11/12**（systemd）
-- root 权限
-- 能访问 GitHub（用于下载 Xray）；网络受限时可在 rysh「全局设置」中配置下载代理
-- 建议使用官方 Alpine 内核，确保支持 `nftables`、tc `clsact`、`flower` 和 police action
+| 系统 / 家族 | 建议版本 | 包管理器 | 服务管理 |
+|---|---|---|---|
+| Alpine Linux | 3.18+ | `apk` | OpenRC |
+| Debian / Ubuntu | Debian 11+ / Ubuntu 20.04+ | `apt` | systemd / SysVinit |
+| Fedora | 当前受支持版本 | `dnf` | systemd |
+| RHEL / Rocky / AlmaLinux / Oracle Linux / CentOS Stream | 8+ | `dnf` / `yum` | systemd |
+| Amazon Linux | 2 / 2023+ | `yum` / `dnf` | systemd |
+| Azure Linux / CBL-Mariner / Photon OS | 当前受支持版本 | `tdnf` | systemd |
+| Fedora minimal / RHEL UBI 等精简镜像 | 当前受支持版本 | `microdnf` | 容器 supervisor / 进程模式 |
+| openSUSE Leap / Tumbleweed | 15.5+ / 当前版本 | `zypper` | systemd |
+| Arch Linux / Manjaro | 滚动版本 | `pacman` | systemd |
+| Void Linux | 当前版本 | `xbps` | runit |
+| Gentoo | 当前稳定版 | `emerge` | OpenRC / systemd |
+| Podman / Docker 容器 | rootful，推荐 Podman 4.4+ | 镜像内 `apk` | 容器 supervisor |
 
-脚本会自动安装所需依赖（Alpine 使用 `apk`，Debian 使用 `apt-get`）：
+支持 `x86_64`、`aarch64/arm64`、`armv8l`、`armv7`、`armv6`、`armv5`、`i386/i686`、`s390x`、`loongarch64/loong64`、`mips32`、`mips32le`、`mips64`、`mips64le`、`ppc64`、`ppc64le` 和 `riscv64`。脚本会把本机架构映射到 Xray 官方发布资产；实际可运行性仍取决于发行版内核、用户空间以及对应上游资产的兼容性。
+
+脚本会自动安装这些基础依赖：
 
 ```text
 curl unzip jq nftables iptables iproute2 ca-certificates
 ```
 
-按需补装：
+按需补装（包名随发行版不同）：
 
-```text
-iproute2-tc iproute2-ss qrencode
-```
+- Alpine：`iproute2-tc`、`iproute2-ss`、`libqrencode-tools`
+- Debian / Ubuntu / openSUSE：`iproute2`、`qrencode`
+- Fedora / RHEL：`iproute`、`iproute-tc`、`qrencode`
+- Arch Linux / Void Linux：`iproute2`、`qrencode`
+- Gentoo：`sys-apps/iproute2`、`media-gfx/qrencode`
+
+基础管理功能通常只需要 root 权限和以上软件包。端口限速、自动封禁等高级功能还要求宿主机内核支持 nftables，以及 tc 的 `clsact`、`flower` 和 police action。非 systemd 系统、精简内核、OpenVZ/LXC 等环境可能只能使用部分功能，脚本会在执行时给出警告。
 
 ## 快速开始
 
@@ -100,6 +118,76 @@ iproute2-tc iproute2-ss qrencode
 5. 需要二维码时，在节点管理菜单选择 `5`；需要导出全部链接时选择 `6`。
 
 创建单个或批量节点时，rysh 会先对 CDN 分类中的前三个候选执行快速 Reality 条件检测，并把合规且握手较快的域名作为默认 SNI/目标地址；检测失败时继续使用全局默认值，仍可在交互提示中修改。
+
+## Podman 部署
+
+容器部署建议使用 **rootful Podman**。项目自带 `Containerfile`、`container-entrypoint.sh` 和 `compose.yaml`。容器入口会在首次启动时安装 Xray，之后由 `rysh serve` 托管 Xray、自动重启和流量监控，不依赖容器内的 systemd/OpenRC，也不需要 cron。
+
+### 直接使用 Podman
+
+```sh
+sudo podman build -t localhost/rysh:latest .
+
+sudo podman run -d \
+  --name rysh \
+  --restart=unless-stopped \
+  --network=host \
+  --cap-add=NET_ADMIN \
+  --cap-add=NET_RAW \
+  -v rysh-config:/etc/rysh \
+  -v xray-config:/usr/local/etc/xray \
+  -v xray-bin:/usr/local/xray \
+  -v xray-assets:/usr/local/share/xray \
+  -v rysh-sni-data:/usr/local/share/rysh \
+  -v xray-logs:/var/log/xray \
+  localhost/rysh:latest
+```
+
+使用 `--network=host` 后，新建节点时填写的监听端口会直接监听宿主机端口，不需要再执行 `-p` 映射。`NET_ADMIN` 用于 nftables/tc，`NET_RAW` 用于网络诊断；缺少这两个能力时，Xray 本身仍可运行，但宿主机级限速和封禁不保证生效。
+
+常用管理命令：
+
+```sh
+sudo podman ps
+sudo podman logs -f rysh
+sudo podman healthcheck run rysh
+sudo podman exec -it rysh ry
+sudo podman exec -it rysh rysh status
+sudo podman exec -it rysh rysh stop
+sudo podman exec -it rysh rysh start
+```
+
+容器内手动执行 `rysh stop` 会暂停 Xray，但保持容器和 supervisor 存活；执行 `rysh start` 会恢复。删除容器时使用 `sudo podman rm -f rysh`，具名卷中的数据不会删除。
+
+如果使用 systemd 宿主机并希望开机后自动拉起，请启用 Podman 的重启服务：`sudo systemctl enable --now podman-restart.service`。也可以改用 Quadlet 管理容器。
+
+### 使用 Compose
+
+```sh
+sudo podman compose up -d --build
+sudo podman compose ps
+sudo podman compose logs -f rysh
+```
+
+如果系统使用独立的 Compose 插件，可改为：
+
+```sh
+sudo podman-compose up -d --build
+```
+
+升级镜像或脚本：
+
+```sh
+git pull
+sudo podman compose build --pull
+sudo podman compose up -d
+```
+
+Compose 使用以下具名卷持久化数据：`rysh-config`、`xray-config`、`xray-bin`、`xray-assets`、`rysh-sni-data`、`xray-logs`。执行 `podman compose down` 不会删除具名卷；只有显式执行 `podman volume rm` 才会清除节点与流量数据。
+
+### rootless Podman 限制
+
+rootless Podman 可以运行 Xray 进程，但无法可靠修改宿主机 nftables 和 tc 规则，也无法保证 host 网络下的宿主机级限速/封禁。需要完整功能时请使用 rootful Podman；rootless 模式更适合仅运行 Xray、由外层防火墙负责端口策略的场景。
 
 创建节点的默认参数：
 
@@ -145,7 +233,7 @@ NAT VPS 创建节点时分别填写实例内监听端口和面板外部映射端
 
 脚本在 Xray 配置中启用了 `StatsService` API（仅监听 `127.0.0.1:10085`），每个节点对应一个用户邮箱 `n<节点ID>`。
 
-cron 任务默认每分钟执行一次：
+宿主机默认由 cron 每分钟执行一次；容器模式由 supervisor 按「监控间隔」循环执行，不需要 cron：
 
 ```text
 * * * * * /usr/local/bin/rysh monitor --quiet
@@ -233,6 +321,7 @@ rysh gen                    输出生成的 Xray 配置
 rysh list                   列出节点
 rysh start|stop|restart     启动/停止/重启服务
 rysh status                 查看服务状态与日志
+rysh health                 检查 Xray 与容器托管状态
 rysh reset-credentials      重置全部节点凭据（保留节点数据）
 rysh uninstall [--purge]    卸载 rysh；--purge 同时删除 Xray 与全部数据
 rysh version                显示脚本版本
@@ -243,10 +332,12 @@ rysh version                显示脚本版本
 ```text
 /usr/local/bin/rysh                    主脚本
 /usr/local/bin/ry                      rysh 快捷命令（指向 rysh 的软链接）
-/etc/init.d/rysh                       OpenRC 策略服务（Alpine）
-/etc/init.d/xray                       OpenRC Xray 服务（Alpine）
-/etc/systemd/system/rysh.service       systemd 策略服务（Debian）
-/etc/systemd/system/xray.service       systemd Xray 服务（Debian）
+/etc/init.d/rysh                       OpenRC / SysVinit 策略服务
+/etc/init.d/xray                       OpenRC / SysVinit Xray 服务
+/etc/systemd/system/rysh.service       systemd 策略服务
+/etc/systemd/system/xray.service       systemd Xray 服务
+/etc/sv/rysh                           runit 策略服务
+/etc/sv/xray                           runit Xray 服务
 /usr/local/bin/xray                    Xray 可执行文件
 /usr/local/etc/xray/config.json        Xray 配置（由脚本生成）
 /usr/local/share/xray/                 geoip.dat / geosite.dat
@@ -262,13 +353,19 @@ rysh version                显示脚本版本
 /etc/crontabs/root 或 root crontab     cron 监控任务
 ```
 
+在 Podman Compose 中，上述 `/etc/rysh`、`/usr/local/etc/xray`、`/usr/local/xray`、`/usr/local/share/xray`、`/usr/local/share/rysh` 和 `/var/log/xray` 会分别挂载到对应具名卷。容器内没有 cron 或 systemd，由 `rysh serve` 负责前台托管。
+
 备份菜单 `21` 会把上述关键文件打包到 `/root/rysh-backup-<时间>.tar.gz`，恢复时从同一菜单选择备份文件即可。
 
 ## 常见问题
 
 **Q: 执行一键脚本提示 `bash: command not found`？**
 
-A: Alpine 最小系统默认没有 bash，执行 `apk add bash curl` 后重试，或改用 `sh /tmp/rysh-oneclick.sh` 的方式。
+A: 当前一键脚本不依赖 Bash。请使用 `curl -fsSL ... -o /tmp/rysh-oneclick.sh && sh /tmp/rysh-oneclick.sh`。如果使用旧版脚本仍出现该提示，请更新到最新版本。
+
+**Q: 脚本提示没有受支持的软件包管理器？**
+
+A: 先确认发行版版本在兼容性表中。极端精简镜像可能删除了包管理器；请手动安装 `curl unzip jq nftables iptables iproute2 openssl ca-certificates`，再运行 `rysh install --yes`。没有 nftables/iptables 时 Xray 仍可运行，但自动封禁不可用。
 
 **Q: 输入 `ry` 提示 `command not found`？**
 
@@ -309,13 +406,21 @@ rysh status
 A: 依次检查：
 
 ```sh
-rc-service xray status
-rc-service crond status
-grep rysh /etc/crontabs/root
+rysh status
+rysh health
+systemctl status crond 2>/dev/null || rc-service crond status 2>/dev/null || sv status crond 2>/dev/null
+crontab -l | grep rysh
 rysh monitor
 ```
 
 确认 Xray 配置中存在 `StatsService` API，并且 `127.0.0.1:10085` 可访问。手动执行 `rysh monitor` 可以立即刷新。
+
+Podman/Docker 容器中不安装 cron；请确认容器 supervisor 正常：
+
+```sh
+podman logs --tail 100 rysh
+podman healthcheck run rysh
+```
 
 **Q: 限速没有生效？**
 
@@ -327,7 +432,7 @@ tc qdisc show dev <网卡>
 tc filter show dev <网卡> egress chain 1381589832
 ```
 
-容器或精简内核可能缺少 `clsact`、`flower` 或 police action 支持。脚本会保留现有 qdisc，并提示无法创建的规则；确认内核支持后可重新执行菜单 `16`。
+容器或精简内核可能缺少 `clsact`、`flower` 或 police action 支持。脚本会保留现有 qdisc，并提示无法创建的规则；确认内核支持后可重新执行菜单 `16`。Podman 部署需要 rootful、host 网络和 `NET_ADMIN`。
 
 **Q: 到期或超流量没有封禁？**
 
@@ -340,7 +445,7 @@ grep rysh /etc/crontabs/root
 rysh monitor
 ```
 
-如果使用 iptables 回退，检查 `iptables -L RYSH_IN -n -v` 和 `iptables -L RYSH_OUT -n -v`。
+如果使用 iptables 回退，检查 `iptables -L RYSH_IN -n -v` 和 `iptables -L RYSH_OUT -n -v`。容器部署还要确认使用 rootful Podman 并添加了 `NET_ADMIN`。
 
 **Q: 忘记节点链接或更换了公网 IP？**
 

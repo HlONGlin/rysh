@@ -1,11 +1,15 @@
 #!/bin/sh
 
-ONECLICK_VERSION="1.0.2"
+ONECLICK_VERSION="1.0.3"
 REPO_RAW="${RYSH_REPO_RAW:-https://github.com/HlONGlin/rysh/raw/main}"
-RYSH_BIN="/usr/local/bin/rysh"
+RYSH_BIN="${RYSH_BIN:-/usr/local/bin/rysh}"
+RYSH_BIN_DIR=${RYSH_BIN%/*}
+[ "$RYSH_BIN_DIR" != "$RYSH_BIN" ] || RYSH_BIN_DIR="."
+RY_SHORTCUT_BIN="${RYSH_SHORTCUT_BIN:-$RYSH_BIN_DIR/ry}"
 RYSH_SRC_URL="$REPO_RAW/rysh.sh"
 TMP_FILE="/tmp/rysh-install.$$"
-DATA_DIR="/usr/local/share/rysh"
+DATA_DIR="${RYSH_SNI_DATA_DIR:-/usr/local/share/rysh}"
+XRAY_LOG_DIR="${RYSH_XRAY_LOG_DIR:-/var/log/xray}"
 
 if [ -t 1 ]; then
     C_RED=$(printf '\033[31m')
@@ -48,6 +52,31 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+os_pretty_name() {
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        if [ -n "${PRETTY_NAME:-}" ]; then
+            printf '%s' "$PRETTY_NAME"
+        else
+            printf '%s' "${NAME:-$(uname -s 2>/dev/null || printf Linux)}"
+        fi
+    else
+        uname -s 2>/dev/null || printf Linux
+    fi
+}
+
+container_label() {
+    if [ -f /run/.containerenv ] || [ -f /.containerenv ]; then
+        printf 'Podman 容器'
+    elif [ -f /.dockerenv ]; then
+        printf 'Docker 容器'
+    elif [ -n "${container:-}" ]; then
+        printf '%s 容器' "$container"
+    else
+        printf '宿主机'
+    fi
+}
+
 cleanup() {
     rm -f "$TMP_FILE" 2>/dev/null
     rm -rf "$TMP_FILE.data" 2>/dev/null
@@ -65,8 +94,20 @@ ensure_downloader() {
         apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
     elif need_cmd dnf; then
         dnf install -y curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd microdnf; then
+        microdnf install -y curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd tdnf; then
+        tdnf install -y curl ca-certificates >/dev/null 2>&1 || true
     elif need_cmd yum; then
         yum install -y curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd zypper; then
+        zypper --non-interactive install curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd pacman; then
+        pacman -Sy --needed --noconfirm curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd xbps-install; then
+        xbps-install -Sy curl ca-certificates >/dev/null 2>&1 || true
+    elif need_cmd emerge; then
+        emerge --ask=n net-misc/curl app-misc/ca-certificates >/dev/null 2>&1 || true
     fi
     need_cmd curl || need_cmd wget || die "缺少 curl/wget，请先安装后再运行"
 }
@@ -120,7 +161,7 @@ install_rysh() {
         fi
     done
     chmod 755 "$TMP_FILE"
-    mkdir -p /usr/local/bin 2>/dev/null
+    mkdir -p "$RYSH_BIN_DIR" 2>/dev/null
     if ! mv "$TMP_FILE" "$RYSH_BIN"; then
         rm -f "$TMP_FILE"
         die "安装到 $RYSH_BIN 失败"
@@ -145,16 +186,17 @@ install_rysh() {
 
 ensure_shortcut() {
     [ -x "$RYSH_BIN" ] || return 0
-    if [ -e /usr/local/bin/ry ] && [ ! -L /usr/local/bin/ry ]; then
-        if ! cmp -s /usr/local/bin/ry "$RYSH_BIN" 2>/dev/null; then
-            warn "/usr/local/bin/ry 已被其他程序占用，未创建快捷命令"
+    mkdir -p "$RYSH_BIN_DIR" 2>/dev/null || true
+    if [ -e "$RY_SHORTCUT_BIN" ] && [ ! -L "$RY_SHORTCUT_BIN" ]; then
+        if ! cmp -s "$RY_SHORTCUT_BIN" "$RYSH_BIN" 2>/dev/null; then
+            warn "$RY_SHORTCUT_BIN 已被其他程序占用，未创建快捷命令"
             return 0
         fi
     fi
-    if ln -sf "$RYSH_BIN" /usr/local/bin/ry 2>/dev/null; then
+    if ln -sf "$RYSH_BIN" "$RY_SHORTCUT_BIN" 2>/dev/null; then
         return 0
     fi
-    cp "$RYSH_BIN" /usr/local/bin/ry 2>/dev/null && chmod 755 /usr/local/bin/ry 2>/dev/null
+    cp "$RYSH_BIN" "$RY_SHORTCUT_BIN" 2>/dev/null && chmod 755 "$RY_SHORTCUT_BIN" 2>/dev/null
 }
 
 start_rysh() {
@@ -163,7 +205,7 @@ start_rysh() {
     if "$RYSH_BIN" start; then
         ok "已启动"
     else
-        err "启动失败，请查看 /var/log/xray/error.log"
+        err "启动失败，请查看 $XRAY_LOG_DIR/error.log"
     fi
 }
 
@@ -209,7 +251,7 @@ main_menu() {
         clear_screen
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
         printf '%s rysh 一键部署 %s - Xray Reality 多节点管理%s\n' "$C_BOLD" "$ONECLICK_VERSION" "$C_NC"
-        printf ' 系统: %s\n' "$(cat /etc/alpine-release 2>/dev/null || uname -s)"
+        printf ' 系统: %s | %s\n' "$(os_pretty_name)" "$(container_label)"
         status_line
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
         printf ' 1. 安装或更新 rysh（含 Xray 核心与依赖）\n'
@@ -219,7 +261,7 @@ main_menu() {
         printf ' 5. 重置节点凭据（保留节点数据）\n'
         printf ' 6. 进入 rysh 节点管理菜单\n'
         printf ' 0. 退出\n'
-        printf '%s提示：安装完成后，在任意目录输入 ry 即可直接唤出面板。%s\n' "$C_DIM" "$C_NC"
+        printf '%s提示：安装完成后，在任意目录输入 ry 即可直接唤出面板。容器内同样适用。%s\n' "$C_DIM" "$C_NC"
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
         case "$choice" in
@@ -240,7 +282,8 @@ usage() {
 rysh 一键部署脚本
 
 用法:
-  bash <(curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh)
+  curl -fsSL https://github.com/HlONGlin/rysh/raw/main/one-click.sh -o /tmp/rysh-oneclick.sh
+  sh /tmp/rysh-oneclick.sh
   one-click.sh [install|start|stop|purge|reset|menu]
 
 命令:
