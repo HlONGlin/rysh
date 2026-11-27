@@ -250,7 +250,7 @@ main_menu() {
     while :; do
         clear_screen
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
-        printf '%s rysh 一键部署 %s - Xray Reality 多节点管理%s\n' "$C_BOLD" "$ONECLICK_VERSION" "$C_NC"
+        printf '%s rysh 一键部署 %s - Xray Reality / SS2022 多节点管理%s\n' "$C_BOLD" "$ONECLICK_VERSION" "$C_NC"
         printf ' 系统: %s | %s\n' "$(os_pretty_name)" "$(container_label)"
         status_line
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"

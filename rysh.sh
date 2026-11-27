@@ -1,8 +1,9 @@
 #!/bin/sh
 
-RYSH_VERSION="1.1.0"
+RYSH_VERSION="1.2.0"
 RYSH_DIR="${RYSH_DIR:-/etc/rysh}"
 NODE_DIR="$RYSH_DIR/nodes"
+ROUTE_DIR="$RYSH_DIR/routes"
 STATE_DIR="$RYSH_DIR/state"
 HISTORY_DIR="$RYSH_DIR/history"
 SETTINGS_FILE="$RYSH_DIR/settings.conf"
@@ -226,8 +227,8 @@ to_int() {
 }
 
 ensure_dirs() {
-    mkdir -p "$RYSH_DIR" "$NODE_DIR" "$STATE_DIR" "$HISTORY_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR" 2>/dev/null
-    chmod 700 "$RYSH_DIR" "$NODE_DIR" "$STATE_DIR" "$HISTORY_DIR" "$XRAY_CONF_DIR" 2>/dev/null
+    mkdir -p "$RYSH_DIR" "$NODE_DIR" "$ROUTE_DIR" "$STATE_DIR" "$HISTORY_DIR" "$XRAY_CONF_DIR" "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR" 2>/dev/null
+    chmod 700 "$RYSH_DIR" "$NODE_DIR" "$ROUTE_DIR" "$STATE_DIR" "$HISTORY_DIR" "$XRAY_CONF_DIR" 2>/dev/null
     chmod 755 "$XRAY_ASSET_DIR" "$XRAY_LOG_DIR" 2>/dev/null
 }
 
@@ -1248,6 +1249,7 @@ port_listening() {
 
 load_node() {
     N_ID=""
+    N_PROTO="vless"
     N_NAME=""
     N_PORT=""
     N_PUBLIC_PORT=""
@@ -1269,10 +1271,13 @@ load_node() {
     N_OUT_B64=""
     N_OUT_LABEL=""
     N_OUT_JSON=""
+    N_SS_METHOD="2022-blake3-aes-256-gcm"
+    N_SS_PASSWORD=""
     f="$NODE_DIR/$1.conf"
     [ -f "$f" ] || return 1
     . "$f"
     N_ID=${N_ID:-$1}
+    N_PROTO=${N_PROTO:-vless}
     N_NAME=${N_NAME:-节点$N_ID}
     N_PUBLIC_PORT=${N_PUBLIC_PORT:-$N_PORT}
     N_ENABLED=${N_ENABLED:-1}
@@ -1284,6 +1289,9 @@ load_node() {
     N_OUT_MODE=${N_OUT_MODE:-inherit}
     N_OUT_B64=${N_OUT_B64:-}
     N_OUT_LABEL=${N_OUT_LABEL:-}
+    N_SS_METHOD=${N_SS_METHOD:-2022-blake3-aes-256-gcm}
+    N_SS_PASSWORD=${N_SS_PASSWORD:-}
+    case "$N_PROTO" in vless|shadowsocks) ;; *) N_PROTO="vless" ;; esac
     case "$N_OUT_MODE" in
         inherit|direct|custom) ;;
         *) N_OUT_MODE="inherit" ;;
@@ -1304,6 +1312,7 @@ save_node() {
     tmp="$NODE_DIR/$N_ID.conf.tmp.$$"
     {
         printf "N_ID='%s'\n" "$N_ID"
+        printf "N_PROTO='%s'\n" "${N_PROTO:-vless}"
         printf "N_NAME='%s'\n" "$(sanitize_text "$N_NAME")"
         printf "N_PORT='%s'\n" "$N_PORT"
         printf "N_PUBLIC_PORT='%s'\n" "${N_PUBLIC_PORT:-$N_PORT}"
@@ -1324,6 +1333,8 @@ save_node() {
         printf "N_OUT_MODE='%s'\n" "${N_OUT_MODE:-inherit}"
         printf "N_OUT_B64='%s'\n" "$(node_out_b64)"
         printf "N_OUT_LABEL='%s'\n" "$(sanitize_text "$N_OUT_LABEL")"
+        printf "N_SS_METHOD='%s'\n" "${N_SS_METHOD:-2022-blake3-aes-256-gcm}"
+        printf "N_SS_PASSWORD='%s'\n" "$(sanitize_text "$N_SS_PASSWORD")"
     } > "$tmp" || return 1
     mv "$tmp" "$NODE_DIR/$N_ID.conf"
     chmod 600 "$NODE_DIR/$N_ID.conf"
@@ -1535,6 +1546,35 @@ gen_uuid() {
     cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '\r\n'
 }
 
+ss2022_methods() {
+    printf '%s\n' \
+        '2022-blake3-aes-128-gcm' \
+        '2022-blake3-aes-256-gcm' \
+        '2022-blake3-chacha20-poly1305'
+}
+
+ss2022_key_bytes() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) printf '16' ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) printf '32' ;;
+        *) return 1 ;;
+    esac
+}
+
+gen_ss2022_password() {
+    bytes=$(ss2022_key_bytes "$1") || return 1
+    if need_cmd openssl; then
+        key=$(openssl rand -base64 "$bytes" 2>/dev/null | tr -d '\r\n')
+        [ -n "$key" ] || return 1
+        printf '%s' "$key"
+        return
+    fi
+    [ -r /dev/urandom ] || return 1
+    key=$(head -c "$bytes" /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
+    [ -n "$key" ] || return 1
+    printf '%s' "$key"
+}
+
 gen_keys() {
     [ -x "$XRAY_BIN" ] || return 1
     out=$("$XRAY_BIN" x25519 2>/dev/null)
@@ -1594,6 +1634,11 @@ build_link() {
     ip="${CACHED_IP:-$(get_public_ip)}"
     public_port="${N_PUBLIC_PORT:-$N_PORT}"
     enc=$(urlencode "$N_NAME")
+    if [ "${N_PROTO:-vless}" = "shadowsocks" ]; then
+        userinfo=$(b64encode "$N_SS_METHOD:$N_SS_PASSWORD" | tr '+/' '-_' | tr -d '=')
+        printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$ip" "$public_port" "$enc"
+        return 0
+    fi
     flow=""
     [ -n "$N_FLOW" ] && flow="&flow=$N_FLOW"
     fp="$N_FP"
@@ -2065,6 +2110,31 @@ node_outbound_summary() {
     esac
 }
 
+node_route_outbound_json() {
+    target_id="$1"
+    load_node "$target_id" || return 1
+    [ "$N_ENABLED" = "1" ] || return 1
+    resolve_node_outbound
+    if [ -n "$R_OUT_JSON" ]; then
+        printf '%s' "$R_OUT_JSON"
+    else
+        printf '%s' '{"protocol":"freedom"}'
+    fi
+}
+
+route_target_outbound_json() {
+    case "$1" in
+        node:*) node_route_outbound_json "${1#node:}" ;;
+        link:*)
+            encoded=${1#link:}
+            [ -n "$encoded" ] || return 1
+            decoded=$(b64decode "$encoded") || return 1
+            printf '%s' "$decoded" | jq -ce 'select(type == "object" and (.protocol | type == "string") and .protocol != "")' 2>/dev/null
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 gen_config() {
     ensure_dirs
     printf '{\n  "log": {\n    "loglevel": "warning",\n    "error": "%s"\n  },\n' "$XRAY_LOG_DIR/error.log"
@@ -2105,6 +2175,23 @@ JSON_HEAD
         printf '    {\n'
         printf '      "listen": "0.0.0.0",\n'
         printf '      "port": %s,\n' "$N_PORT"
+        if [ "$N_PROTO" = "shadowsocks" ]; then
+            printf '      "protocol": "shadowsocks",\n'
+            printf '      "settings": {\n'
+            printf '        "network": "tcp,udp",\n'
+            printf '        "method": "%s",\n' "$N_SS_METHOD"
+            printf '        "password": "%s",\n' "$N_SS_PASSWORD"
+            printf '        "level": 0,\n'
+            printf '        "email": "n%s"\n' "$N_ID"
+            printf '      },\n'
+            printf '      "sniffing": {\n'
+            printf '        "enabled": true,\n'
+            printf '        "destOverride": ["http", "tls", "quic"]\n'
+            printf '      },\n'
+            printf '      "tag": "rysh-%s"\n' "$N_ID"
+            printf '    }\n'
+            continue
+        fi
         printf '      "protocol": "vless",\n'
         printf '      "settings": {\n'
         printf '        "clients": [\n'
@@ -2166,6 +2253,26 @@ JSON_HEAD
         printf '    %s\n' "$out_json"
     done
 
+    # Add outbounds referenced by routes.
+    for route_file in "$ROUTE_DIR"/*.routes; do
+        [ -f "$route_file" ] || continue
+        route_id=${route_file##*/}
+        route_id=${route_id%.routes}
+        route_no=0
+        while IFS="$(printf '\t')" read -r route_match route_target; do
+            [ -n "$route_match" ] && [ -n "$route_target" ] || continue
+            route_match_is_valid "$route_match" || continue
+            route_no=$((route_no + 1))
+            case "$route_target" in node:*|link:*) ;; *) continue ;; esac
+            out_json=$(route_target_outbound_json "$route_target") || continue
+            route_tag="rysh-route-$route_id-$route_no"
+            out_json=$(outbound_with_tag "$out_json" "$route_tag") || continue
+            [ -n "$out_json" ] || continue
+            printf '    ,\n'
+            printf '    %s\n' "$out_json"
+        done < "$route_file"
+    done
+
     printf '  ],\n'
     printf '  "routing": {\n'
     printf '    "rules": [\n'
@@ -2174,6 +2281,38 @@ JSON_HEAD
     printf '        "inboundTag": ["api"],\n'
     printf '        "outboundTag": "api"\n'
     printf '      }\n'
+
+    for route_file in "$ROUTE_DIR"/*.routes; do
+        [ -f "$route_file" ] || continue
+        route_id=${route_file##*/}
+        route_id=${route_id%.routes}
+        load_node "$route_id" || continue
+        [ "$N_ENABLED" = "1" ] || continue
+        route_no=0
+        while IFS="$(printf '\t')" read -r route_match route_target; do
+            [ -n "$route_match" ] && [ -n "$route_target" ] || continue
+            route_match_is_valid "$route_match" || continue
+            route_no=$((route_no + 1))
+            case "$route_target" in
+                direct|block) route_out_tag="$route_target" ;;
+                node:*|link:*)
+                    if (route_target_outbound_json "$route_target" >/dev/null); then
+                        route_out_tag="rysh-route-$route_id-$route_no"
+                    else
+                        route_out_tag="block"
+                    fi
+                    ;;
+                *) continue ;;
+            esac
+            printf '      ,\n'
+            printf '      {\n'
+            printf '        "type": "field",\n'
+            printf '        "domain": ["%s"],\n' "$route_match"
+            printf '        "inboundTag": ["rysh-%s"],\n' "$route_id"
+            printf '        "outboundTag": "%s"\n' "$route_out_tag"
+            printf '      }'
+        done < "$route_file"
+    done
 
     for id in $(node_ids); do
         load_node "$id" || continue
@@ -2863,6 +3002,7 @@ ask_node_id() {
 
 new_node_record() {
     id=$(next_id)
+    N_PROTO="vless"
     uuid=$(gen_uuid)
     [ -n "$uuid" ] || return 1
     keys=$(gen_keys) || return 1
@@ -2876,6 +3016,7 @@ new_node_record() {
         [ "$days" -gt 0 ] && expires=$(( $(date +%s) + days * 86400 ))
     fi
     N_ID="$id"
+    N_PROTO="vless"
     N_NAME="$1"
     N_PORT="$2"
     N_PUBLIC_PORT="$2"
@@ -2893,6 +3034,44 @@ new_node_record() {
     N_QUOTA_GB="$7"
     N_RATE_MBPS="$8"
     N_REMARK=""
+    save_node || return 1
+    printf '%s' "$id"
+}
+
+new_ss2022_record() {
+    id=$(next_id)
+    method="$1"
+    password=$(gen_ss2022_password "$method") || return 1
+    expires=0
+    if is_uint "$9"; then
+        days=$(to_int "$9")
+        [ "$days" -gt 0 ] && expires=$(( $(date +%s) + days * 86400 ))
+    fi
+    N_ID="$id"
+    N_PROTO="shadowsocks"
+    N_NAME="$2"
+    N_PORT="$3"
+    N_PUBLIC_PORT="$3"
+    N_UUID=""
+    N_PRIV=""
+    N_PUB=""
+    N_SID=""
+    N_SNI=""
+    N_DEST=""
+    N_FLOW=""
+    N_FP=""
+    N_SS_METHOD="$method"
+    N_SS_PASSWORD="$password"
+    N_ENABLED="1"
+    N_CREATED="$(date +%s)"
+    N_EXPIRES="$expires"
+    N_QUOTA_GB="$7"
+    N_RATE_MBPS="$8"
+    N_REMARK=""
+    N_OUT_MODE="inherit"
+    N_OUT_B64=""
+    N_OUT_LABEL=""
+    N_OUT_JSON=""
     save_node || return 1
     printf '%s' "$id"
 }
@@ -2990,6 +3169,270 @@ create_node() {
     CACHED_IP=$(get_public_ip)
     build_link
     unset CACHED_IP
+}
+
+create_ss2022_node() {
+    require_xray
+    id=$(next_id)
+    name="SS2022-$id"
+    prompt_default "节点名称" "$name"
+    name=$(sanitize_text "$REPLY")
+    [ -n "$name" ] || name="SS2022-$id"
+
+    auto=$(random_port) || die "找不到空闲端口"
+    prompt_default "端口" "$auto"
+    port=$(sanitize_text "$REPLY")
+    while ! validate_new_port "$port"; do
+        warn "端口无效、被占用或是 API 端口"
+        prompt_default "端口" "$auto"
+        port=$(sanitize_text "$REPLY")
+    done
+    port=$(to_int "$port")
+    prompt_default "面板外部映射端口 (直连填写同监听端口)" "$port"
+    public_port=$(sanitize_text "$REPLY")
+    while ! is_uint "$public_port" || [ "$(to_int "$public_port")" -lt 1 ] || [ "$(to_int "$public_port")" -gt 65535 ]; do
+        warn "请输入 1-65535 之间的外部端口"
+        prompt_default "面板外部映射端口" "$port"
+        public_port=$(sanitize_text "$REPLY")
+    done
+    public_port=$(to_int "$public_port")
+
+    method="2022-blake3-aes-256-gcm"
+    printf 'SS2022 加密方法:\n'
+    printf '1. 2022-blake3-aes-128-gcm (16 字节密钥)\n'
+    printf '2. 2022-blake3-aes-256-gcm (32 字节密钥)\n'
+    printf '3. 2022-blake3-chacha20-poly1305 (32 字节密钥)\n'
+    printf '请选择 [2]: '
+    read -r c 2>/dev/null || c=""
+    case "$c" in
+        1) method="2022-blake3-aes-128-gcm" ;;
+        3) method="2022-blake3-chacha20-poly1305" ;;
+    esac
+
+    rate="0"
+    quota="0"
+    days="0"
+    printf '是否现在设置限速/月限额/到期时间? [y/N]: '
+    read -r adv 2>/dev/null || adv=""
+    case "$adv" in
+        y|Y)
+            prompt_default "限速 Mbps (0=不限)" "0"
+            rate=$(sanitize_text "$REPLY")
+            while ! is_number "$rate"; do
+                warn "请输入数字"
+                prompt_default "限速 Mbps (0=不限)" "0"
+                rate=$(sanitize_text "$REPLY")
+            done
+            prompt_default "月流量限额 GB (0=不限)" "0"
+            quota=$(sanitize_text "$REPLY")
+            while ! is_number "$quota"; do
+                warn "请输入数字"
+                prompt_default "月流量限额 GB (0=不限)" "0"
+                quota=$(sanitize_text "$REPLY")
+            done
+            prompt_default "有效期天数 (0=永久)" "0"
+            days=$(sanitize_text "$REPLY")
+            while ! is_uint "$days"; do
+                warn "请输入整数天数"
+                prompt_default "有效期天数 (0=永久)" "0"
+                days=$(sanitize_text "$REPLY")
+            done
+            ;;
+    esac
+
+    nid=$(new_ss2022_record "$method" "$name" "$port" "$public_port" "" "" "$quota" "$rate" "$days") || die "创建 SS2022 节点失败"
+    load_node "$nid"
+    N_PUBLIC_PORT="$public_port"
+    save_node || warn "节点已创建，但外部映射端口保存失败"
+    if ! apply_config; then
+        warn "节点已保存，但配置应用失败，请检查后重试"
+        return 1
+    fi
+    apply_tc_all
+    monitor_run --quiet
+    log_event "created SS2022 node $nid port $port"
+    ok "SS2022 节点 $nid 创建成功"
+    load_node "$nid"
+    CACHED_IP=$(get_public_ip)
+    build_link
+    unset CACHED_IP
+}
+
+route_file_for_id() {
+    printf '%s/%s.routes' "$ROUTE_DIR" "$1"
+}
+
+route_rule_count() {
+    f=$(route_file_for_id "$1")
+    [ -f "$f" ] || { printf '0'; return; }
+    awk -F '\t' 'NF >= 2 && $1 != "" && $2 != "" {n++} END {print n+0}' "$f"
+}
+
+show_route_rules() {
+    id="$1"
+    f=$(route_file_for_id "$id")
+    printf '路由规则（来源节点 %s）:\n' "$id"
+    if [ ! -s "$f" ]; then
+        printf '  暂无规则\n'
+        return 0
+    fi
+    n=0
+    while IFS="$(printf '\t')" read -r route_match route_target; do
+        [ -n "$route_match" ] && [ -n "$route_target" ] || continue
+        n=$((n + 1))
+        case "$route_target" in
+            link:*)
+                route_kind=$(route_target_outbound_json "$route_target" | jq -r '.protocol' 2>/dev/null) || route_kind="无效"
+                printf '  %s. %-28s -> 分享链接出口 (%s)\n' "$n" "$route_match" "$route_kind"
+                ;;
+            *) printf '  %s. %-28s -> %s\n' "$n" "$route_match" "$route_target" ;;
+        esac
+    done < "$f"
+}
+
+route_target_is_valid() {
+    source_id="$1"
+    target="$2"
+    case "$target" in
+        direct) return 0 ;;
+        node:*)
+            target_id=${target#node:}
+            is_uint "$target_id" || return 1
+            target_id=$(to_int "$target_id")
+            [ "$target_id" != "$source_id" ] || return 1
+            load_node "$target_id" || return 1
+            [ "$N_ENABLED" = "1" ] || return 1
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+route_match_is_valid() {
+    case "$1" in
+        domain:*|full:*|keyword:*)
+            value=${1#*:}
+            [ -n "$value" ] || return 1
+            printf '%s' "$value" | grep -Eq '^[A-Za-z0-9._*?%-]+$'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+route_rules_menu_for_id() {
+    require_xray
+    source_id="$1"
+    if [ -z "$source_id" ]; then
+        ask_node_id || return 1
+        source_id="$NODE_INPUT"
+    fi
+    load_node "$source_id" || {
+        err "节点不存在"
+        return 1
+    }
+    while :; do
+        load_node "$source_id" || return 1
+        clear_screen
+        printf '%s路由规则%s\n\n' "$C_BOLD" "$C_NC"
+        printf '来源节点: [%s] %s (%s)\n\n' "$N_ID" "$N_NAME" "$N_PROTO"
+        show_route_rules "$source_id"
+        printf '\n1. 添加规则\n2. 删除规则\n3. 清空规则\n0. 返回\n请选择: '
+        read -r c 2>/dev/null || c=""
+        case "$c" in
+            1)
+                printf '匹配类型: 1=domain(域名及子域名) 2=full(完整域名) 3=keyword(关键词) [1]: '
+                read -r kind_choice 2>/dev/null || kind_choice=""
+                case "$kind_choice" in
+                    2) kind="full" ;;
+                    3) kind="keyword" ;;
+                    *) kind="domain" ;;
+                esac
+                prompt_default "匹配值" "example.com"
+                route_value=$(sanitize_text "$REPLY")
+                route_match="$kind:$route_value"
+                if ! route_match_is_valid "$route_match"; then
+                    warn "匹配值为空或包含不支持的字符"
+                    pause
+                    continue
+                fi
+                prompt_default "目标节点 ID、v2rayN 分享链接或 direct=直连" "direct"
+                route_target=$(sanitize_text "$REPLY")
+                case "$route_target" in
+                    direct|'') route_target="direct" ;;
+                    vmess://*|vless://*|trojan://*|ss://*)
+                        if ! parse_outbound_any "$route_target"; then
+                            warn "分享链接解析失败或格式不受支持"
+                            pause
+                            continue
+                        fi
+                        if ! outbound_self_test "$OUT_JSON"; then
+                            warn "分享链接未通过 Xray 配置校验"
+                            [ -n "${OUT_TEST_MSG:-}" ] && printf '%s\n' "$OUT_TEST_MSG" >&2
+                            pause
+                            continue
+                        fi
+                        route_target="link:$(b64encode "$OUT_JSON")"
+                        ;;
+                    node:*)
+                        target_id=${route_target#node:}
+                        if is_uint "$target_id"; then
+                            route_target="node:$(to_int "$target_id")"
+                        else
+                            route_target="invalid"
+                        fi
+                        ;;
+                    *[!0-9]*) route_target="invalid" ;;
+                    *) route_target="node:$(to_int "$route_target")" ;;
+                esac
+                if ! (case "$route_target" in link:*) route_target_outbound_json "$route_target" >/dev/null ;; *) route_target_is_valid "$source_id" "$route_target" ;; esac); then
+                    warn "目标节点不存在、已禁用或不能指向来源节点"
+                    pause
+                    continue
+                fi
+                f=$(route_file_for_id "$source_id")
+                ensure_dirs
+                printf '%s\t%s\n' "$route_match" "$route_target" >> "$f"
+                chmod 600 "$f"
+                apply_config || warn "规则已保存，但配置应用失败"
+                ok "路由规则已添加"
+                ;;
+            2)
+                count=$(route_rule_count "$source_id")
+                [ "$count" -gt 0 ] || { warn "暂无规则"; pause; continue; }
+                prompt_default "删除第几条规则" "1"
+                n=$(sanitize_text "$REPLY")
+                if ! is_uint "$n" || [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
+                    warn "规则编号无效"
+                    pause
+                    continue
+                fi
+                f=$(route_file_for_id "$source_id")
+                tmp="$f.tmp.$$"
+                awk -v skip="$n" -F '\t' 'NF >= 2 {n++; if(n != skip) print $0}' OFS='\t' "$f" > "$tmp" && mv "$tmp" "$f"
+                chmod 600 "$f"
+                apply_config || warn "规则已删除，但配置应用失败"
+                ok "路由规则已删除"
+                ;;
+            3)
+                if [ "$(route_rule_count "$source_id")" -gt 0 ]; then
+                    printf '确认清空来源节点 %s 的全部路由规则? [y/N]: ' "$source_id"
+                    read -r a 2>/dev/null || a=""
+                    case "$a" in
+                        y|Y)
+                            : > "$(route_file_for_id "$source_id")"
+                            apply_config || warn "规则已清空，但配置应用失败"
+                            ok "路由规则已清空"
+                            ;;
+                    esac
+                else
+                    warn "暂无规则"
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        pause
+    done
 }
 
 batch_create() {
@@ -3091,16 +3534,22 @@ show_node_detail() {
     load_state "$1"
     printf 'ID       : %s\n' "$N_ID"
     printf '名称     : %s\n' "$N_NAME"
+    printf '协议     : %s\n' "$N_PROTO"
     printf '监听端口 : %s\n' "$N_PORT"
     [ "$N_PUBLIC_PORT" = "$N_PORT" ] || printf '外部端口 : %s (面板映射)\n' "$N_PUBLIC_PORT"
     printf '状态     : %s\n' "$(node_status)"
-    printf 'SNI      : %s\n' "$N_SNI"
-    printf '目标     : %s\n' "$N_DEST"
-    printf '流控     : %s\n' "$([ -n "$N_FLOW" ] && printf '%s' "$N_FLOW" || printf '无')"
-    printf '指纹     : %s\n' "$N_FP"
-    printf 'UUID     : %s\n' "$N_UUID"
-    printf '公钥     : %s\n' "$N_PUB"
-    printf 'ShortID  : %s\n' "$N_SID"
+    if [ "$N_PROTO" = "shadowsocks" ]; then
+        printf '加密方法 : %s\n' "$N_SS_METHOD"
+        printf '密码     : %s\n' "$N_SS_PASSWORD"
+    else
+        printf 'SNI      : %s\n' "$N_SNI"
+        printf '目标     : %s\n' "$N_DEST"
+        printf '流控     : %s\n' "$([ -n "$N_FLOW" ] && printf '%s' "$N_FLOW" || printf '无')"
+        printf '指纹     : %s\n' "$N_FP"
+        printf 'UUID     : %s\n' "$N_UUID"
+        printf '公钥     : %s\n' "$N_PUB"
+        printf 'ShortID  : %s\n' "$N_SID"
+    fi
     printf '本月流量 : %s\n' "$(human_bytes "$(month_used_bytes)")"
     printf '总流量   : %s\n' "$(human_bytes "$(total_used_bytes)")"
     if is_zero_number "$N_QUOTA_GB"; then
@@ -3125,17 +3574,16 @@ show_nodes() {
         return 0
     fi
     printf '%-4s %s %-7s %-7s %-10s %-22s %-11s %-11s %s\n' \
-        'ID' "$(pad_text '名称' 22)" '监听' '外部' '状态' '本月用量 / 限额' '总流量' '到期' '出口'
+        'ID' "$(pad_text '名称' 22)" '协议' '监听' '外部' '状态' '本月用量 / 限额' '总流量' '到期'
     printf '%s\n' '----------------------------------------------------------------------------------------------------------'
     for id in $ids; do
         load_node "$id" || continue
         load_state "$id"
         state=$(node_status)
         color=$(status_color "$state")
-        printf '%-4s %s %-7s %-7s %s%-10s%s %-22s %-11s %-11s %s\n' \
-            "$id" "$(pad_text "$N_NAME" 22)" "$N_PORT" "$N_PUBLIC_PORT" "$color" "$state" "$C_NC" \
-            "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")" \
-            "$(node_outbound_summary)"
+        printf '%-4s %s %-9s %-7s %-7s %s%-10s%s %-22s %-11s %-11s\n' \
+            "$id" "$(pad_text "$N_NAME" 22)" "$N_PROTO" "$N_PORT" "$N_PUBLIC_PORT" "$color" "$state" "$C_NC" \
+            "$(quota_progress)" "$(human_bytes "$(total_used_bytes)")" "$(fmt_time "$N_EXPIRES")"
     done
     printf '\n图例: %s正常%s  %s即将到期%s  %s已禁用/已到期/超月限额%s\n' \
         "$C_GREEN" "$C_NC" "$C_YELLOW" "$C_NC" "$C_RED" "$C_NC"
@@ -3345,12 +3793,21 @@ modify_node() {
         clear_screen
         show_node_detail "$id"
         printf '\n'
-        printf ' 1. 修改名称        2. 修改监听端口\n'
-        printf ' 3. 修改 SNI/目标   4. 修改流控\n'
-        printf ' 5. 修改指纹        6. 重置 UUID\n'
-        printf ' 7. 重置 Reality 密钥  8. 修改备注\n'
-        printf ' 9. 查看节点链接   10. 修改外部映射端口\n'
-        printf '11. 设置出口(可经代理中转)\n'
+        if [ "$N_PROTO" = "shadowsocks" ]; then
+            printf ' 1. 修改名称        2. 修改监听端口\n'
+            printf ' 8. 修改备注        9. 查看节点链接\n'
+            printf '10. 修改外部映射端口 11. 设置出口\n'
+            printf '12. 修改 SS2022 加密方法  13. 重置 SS2022 密钥\n'
+            printf '14. 管理路由规则\n'
+        else
+            printf ' 1. 修改名称        2. 修改监听端口\n'
+            printf ' 3. 修改 SNI/目标   4. 修改流控\n'
+            printf ' 5. 修改指纹        6. 重置 UUID\n'
+            printf ' 7. 重置 Reality 密钥  8. 修改备注\n'
+            printf ' 9. 查看节点链接   10. 修改外部映射端口\n'
+            printf '11. 设置出口(可经代理中转)\n'
+            printf '12. 管理路由规则\n'
+        fi
         printf ' 0. 返回\n'
         printf '请选择: '
         read -r c 2>/dev/null || c=""
@@ -3379,6 +3836,7 @@ modify_node() {
                 monitor_run --quiet
                 ;;
             3)
+                [ "$N_PROTO" = "vless" ] || { warn "此选项仅适用于 VLESS 节点"; continue; }
                 prompt_default "新 SNI" "$N_SNI"
                 s=$(sanitize_text "$REPLY")
                 while ! validate_sni "$s"; do
@@ -3399,6 +3857,7 @@ modify_node() {
                 apply_config || true
                 ;;
             4)
+                [ "$N_PROTO" = "vless" ] || { warn "此选项仅适用于 VLESS 节点"; continue; }
                 prompt_default "新流控 (留空表示无)" "$N_FLOW"
                 f=$(sanitize_text "$REPLY")
                 case "$f" in
@@ -3410,6 +3869,7 @@ modify_node() {
                 apply_config || true
                 ;;
             5)
+                [ "$N_PROTO" = "vless" ] || { warn "此选项仅适用于 VLESS 节点"; continue; }
                 prompt_default "新指纹" "$N_FP"
                 v=$(sanitize_text "$REPLY")
                 if printf '%s' "$v" | grep -Eq '^[A-Za-z0-9-]+$'; then
@@ -3421,6 +3881,7 @@ modify_node() {
                 fi
                 ;;
             6)
+                [ "$N_PROTO" = "vless" ] || { warn "此选项仅适用于 VLESS 节点"; continue; }
                 printf '确认重置 UUID? 客户端需要更新链接 [y/N]: '
                 read -r a 2>/dev/null || a=""
                 case "$a" in
@@ -3439,6 +3900,7 @@ modify_node() {
                 esac
                 ;;
             7)
+                [ "$N_PROTO" = "vless" ] || { warn "此选项仅适用于 VLESS 节点"; continue; }
                 printf '确认重置 Reality 密钥? 客户端需要更新链接 [y/N]: '
                 read -r a 2>/dev/null || a=""
                 case "$a" in
@@ -3485,6 +3947,37 @@ modify_node() {
             11)
                 set_node_outbound_for_id "$id"
                 ;;
+            12)
+                if [ "$N_PROTO" = "shadowsocks" ]; then
+                    printf '1. 2022-blake3-aes-128-gcm\n2. 2022-blake3-aes-256-gcm\n3. 2022-blake3-chacha20-poly1305\n请选择: '
+                    read -r c 2>/dev/null || c=""
+                    case "$c" in
+                        1) N_SS_METHOD="2022-blake3-aes-128-gcm" ;;
+                        2) N_SS_METHOD="2022-blake3-aes-256-gcm" ;;
+                        3) N_SS_METHOD="2022-blake3-chacha20-poly1305" ;;
+                        *) warn "无效选项"; continue ;;
+                    esac
+                    N_SS_PASSWORD=$(gen_ss2022_password "$N_SS_METHOD") || { warn "密钥生成失败"; continue; }
+                    save_node && apply_config || warn "配置应用失败"
+                    CACHED_IP=$(get_public_ip)
+                    printf '\n%s\n' "$(build_link)"
+                    unset CACHED_IP
+                else
+                    (route_rules_menu_for_id "$id")
+                fi
+                ;;
+            13)
+                [ "$N_PROTO" = "shadowsocks" ] || { warn "无效选项"; continue; }
+                N_SS_PASSWORD=$(gen_ss2022_password "$N_SS_METHOD") || { warn "密钥生成失败"; continue; }
+                save_node && apply_config || warn "配置应用失败"
+                CACHED_IP=$(get_public_ip)
+                printf '\n%s\n' "$(build_link)"
+                unset CACHED_IP
+                ;;
+            14)
+                [ "$N_PROTO" = "shadowsocks" ] || { warn "无效选项"; continue; }
+                (route_rules_menu_for_id "$id")
+                ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -3510,6 +4003,13 @@ delete_node() {
     load_state "$id"
     archive_month
     rm -f "$NODE_DIR/$id.conf" "$STATE_DIR/$id.state"
+    rm -f "$(route_file_for_id "$id")"
+    for route_file in "$ROUTE_DIR"/*.routes; do
+        [ -f "$route_file" ] || continue
+        tmp="$route_file.tmp.$$"
+        awk -F '\t' -v target="node:$id" 'BEGIN {OFS="\t"} $2 == target {$2="block"} {print}' "$route_file" > "$tmp" && mv "$tmp" "$route_file"
+        chmod 600 "$route_file"
+    done
     log_event "deleted node $id"
     apply_config || true
     apply_tc_all
@@ -4597,7 +5097,7 @@ reset_all_credentials() {
     fi
     count=$(printf '%s\n' $ids | wc -l | tr -d ' ')
     if [ "${RYSH_ASSUME_YES:-0}" != "1" ]; then
-        printf '将重置 %s 个节点的 UUID、ShortID 与 Reality 密钥，客户端需重新导入。继续? [y/N]: ' "$count"
+        printf '将重置 %s 个节点的协议凭据（UUID、Reality 密钥或 SS2022 密钥），客户端需重新导入。继续? [y/N]: ' "$count"
         read -r a 2>/dev/null || a=""
         case "$a" in
             y|Y) ;;
@@ -4609,6 +5109,16 @@ reset_all_credentials() {
     failed=0
     for id in $ids; do
         load_node "$id" || continue
+        if [ "$N_PROTO" = "shadowsocks" ]; then
+            N_SS_PASSWORD=$(gen_ss2022_password "$N_SS_METHOD") || {
+                warn "节点 $id SS2022 密钥生成失败，已跳过"
+                failed=$((failed + 1))
+                continue
+            }
+            save_node || { failed=$((failed + 1)); continue; }
+            changed=$((changed + 1))
+            continue
+        fi
         u=$(gen_uuid)
         keys=$(gen_keys)
         sid=$(gen_shortid)
@@ -4823,6 +5333,7 @@ main_menu() {
         printf '23. 卸载                       24. 编辑 Xray 配置\n'
         printf '25. 测试节点连通性             26. Reality SNI 检测\n'
         printf '27. NAT VPS 部署检查           28. 设置节点出口\n'
+        printf '29. 创建 SS2022 节点           30. 配置域名路由\n'
         printf '                                   0. 退出\n'
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
@@ -4856,6 +5367,8 @@ main_menu() {
             26) check_sni_candidates; pause ;;
             27) nat_diagnostics; pause ;;
             28) set_node_outbound_menu; pause ;;
+            29) create_ss2022_node; pause ;;
+            30) route_rules_menu_for_id "" ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
