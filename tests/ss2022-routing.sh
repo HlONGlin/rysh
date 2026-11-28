@@ -34,12 +34,26 @@ upstream=$(printf '%s' '{"protocol":"socks","settings":{"servers":[{"address":"1
 printf "%s\n" "N_ID='5'" "N_NAME='upstream'" "N_PORT='11005'" "N_ENABLED='1'" \
     "N_OUT_MODE='custom'" "N_OUT_B64='$upstream'" > "$NODE_DIR/5.conf"
 printf "%s\n" "N_ID='6'" "N_NAME='disabled'" "N_PORT='11006'" "N_ENABLED='0'" > "$NODE_DIR/6.conf"
+socks_id=$(new_socks5_record 'test-socks' 11007 0 0 0)
+[ "$socks_id" = 7 ]
+load_node "$socks_id"
+[ "$N_PROTO" = socks5 ]
+[ "$N_SOCKS_USER" = "n$socks_id" ]
+[ "${#N_SOCKS_PASS}" = 48 ]
+stats_prefix=$(node_stats_prefix "$socks_id")
+[ "$stats_prefix" = "inbound>>>rysh-$socks_id>>>traffic>>>" ]
+(stats_query() { printf '{"stat":[{"name":"inbound>>>rysh-7>>>traffic>>>uplink","value":123},{"name":"inbound>>>rysh-7>>>traffic>>>downlink","value":456}]}' ; }
+[ "$(stats_user_baseline "$socks_id")" = '123 456' ])
+(N_SOCKS_UDP_IP='203.0.113.7'; save_node)
+socks_link=$(build_link)
+parse_outbound_any "$socks_link"
+[ "$OUT_KIND" = socks ]
 printf '%s\t%s\n' 'invalid:bad' 'direct' 'domain:example.com' 'node:5' \
     'full:direct.example.com' 'direct' 'keyword:skip' 'node:6' > "$ROUTE_DIR/1.routes"
 vmess_data=$(b64encode '{"v":"2","add":"example.com","port":"443","id":"00000000-0000-4000-8000-000000000001","net":"tcp","tls":"tls"}')
 for test_link in "vmess://$vmess_data" \
     'vless://00000000-0000-4000-8000-000000000001@example.com:443?security=tls&type=tcp' \
-    'trojan://test-password@example.com:443?security=tls' "$link"; do
+    'trojan://test-password@example.com:443?security=tls' "$link" "$socks_link"; do
     parse_outbound_any "$test_link"
     route_kind="$OUT_KIND"
     encoded_out=$(b64encode "$OUT_JSON")
@@ -67,6 +81,7 @@ load_node 4
 gen_config > "$tmp/config.json"
 jq -e '
     ([.inbounds[] | select(.protocol == "shadowsocks")] | length) == 3 and
+    ([.inbounds[] | select(.protocol == "socks" and .settings.auth == "password" and .settings.udp == true and .settings.ip == "203.0.113.7" and .settings.accounts[0].user == "n7" and (.settings.accounts[0].pass | length) == 48)] | length) == 1 and
     ([.inbounds[] | select(.tag == "rysh-4" and .protocol == "vless")] | length) == 1 and
     ([.routing.rules[] | select(.domain == ["domain:example.com"] and .outboundTag == "rysh-route-1-1")] | length) == 1 and
     ([.outbounds[] | select(.tag == "rysh-route-1-1" and .protocol == "socks")] | length) == 1 and
@@ -77,10 +92,11 @@ jq -e '
     ([.outbounds[] | select(.tag == "rysh-route-1-5" and .protocol == "vless")] | length) == 1 and
     ([.outbounds[] | select(.tag == "rysh-route-1-6" and .protocol == "trojan")] | length) == 1 and
     ([.outbounds[] | select(.tag == "rysh-route-1-7" and .protocol == "shadowsocks")] | length) == 1 and
+    ([.outbounds[] | select(.tag == "rysh-route-1-8" and .protocol == "socks")] | length) == 1 and
     ([.routing.rules[] | select(.domain == ["full:broken.example.com"] and .outboundTag == "block")] | length) == 1
 ' < "$tmp/config.json" >/dev/null
 if [ -n "${RYSH_TEST_XRAY:-}" ]; then
-    jq 'del(.log.error) | .inbounds |= map(select(.protocol == "shadowsocks" or .tag == "api")) | .routing.rules |= map(select(.inboundTag != ["rysh-5"]))' < "$tmp/config.json" > "$tmp/xray-test.json"
+    jq 'del(.log.error) | .inbounds |= map(select(.protocol == "shadowsocks" or .protocol == "socks" or .tag == "api")) | .routing.rules |= map(select(.inboundTag != ["rysh-5"]))' < "$tmp/config.json" > "$tmp/xray-test.json"
     config_path="$tmp/xray-test.json"
     if command -v cygpath >/dev/null 2>&1; then config_path=$(cygpath -w "$config_path"); fi
     "$RYSH_TEST_XRAY" run -test -c "$config_path"

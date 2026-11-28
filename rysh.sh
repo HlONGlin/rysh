@@ -1,6 +1,6 @@
 #!/bin/sh
 
-RYSH_VERSION="1.2.0"
+RYSH_VERSION="1.3.0"
 RYSH_DIR="${RYSH_DIR:-/etc/rysh}"
 NODE_DIR="$RYSH_DIR/nodes"
 ROUTE_DIR="$RYSH_DIR/routes"
@@ -1273,6 +1273,9 @@ load_node() {
     N_OUT_JSON=""
     N_SS_METHOD="2022-blake3-aes-256-gcm"
     N_SS_PASSWORD=""
+    N_SOCKS_USER=""
+    N_SOCKS_PASS=""
+    N_SOCKS_UDP_IP=""
     f="$NODE_DIR/$1.conf"
     [ -f "$f" ] || return 1
     . "$f"
@@ -1291,7 +1294,10 @@ load_node() {
     N_OUT_LABEL=${N_OUT_LABEL:-}
     N_SS_METHOD=${N_SS_METHOD:-2022-blake3-aes-256-gcm}
     N_SS_PASSWORD=${N_SS_PASSWORD:-}
-    case "$N_PROTO" in vless|shadowsocks) ;; *) N_PROTO="vless" ;; esac
+    N_SOCKS_USER=${N_SOCKS_USER:-n$N_ID}
+    N_SOCKS_PASS=${N_SOCKS_PASS:-}
+    N_SOCKS_UDP_IP=${N_SOCKS_UDP_IP:-}
+    case "$N_PROTO" in vless|shadowsocks|socks5) ;; *) N_PROTO="vless" ;; esac
     case "$N_OUT_MODE" in
         inherit|direct|custom) ;;
         *) N_OUT_MODE="inherit" ;;
@@ -1335,6 +1341,9 @@ save_node() {
         printf "N_OUT_LABEL='%s'\n" "$(sanitize_text "$N_OUT_LABEL")"
         printf "N_SS_METHOD='%s'\n" "${N_SS_METHOD:-2022-blake3-aes-256-gcm}"
         printf "N_SS_PASSWORD='%s'\n" "$(sanitize_text "$N_SS_PASSWORD")"
+        printf "N_SOCKS_USER='%s'\n" "$(sanitize_text "${N_SOCKS_USER:-}")"
+        printf "N_SOCKS_PASS='%s'\n" "$(sanitize_text "${N_SOCKS_PASS:-}")"
+        printf "N_SOCKS_UDP_IP='%s'\n" "$(sanitize_text "${N_SOCKS_UDP_IP:-}")"
     } > "$tmp" || return 1
     mv "$tmp" "$NODE_DIR/$N_ID.conf"
     chmod 600 "$NODE_DIR/$N_ID.conf"
@@ -1459,6 +1468,10 @@ validate_sni() {
         *.*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+validate_ipv4() {
+    printf '%s\n' "$1" | awk -F. 'NF != 4 {exit 1} {for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i+0 > 255) exit 1}'
 }
 
 validate_dest() {
@@ -1637,6 +1650,12 @@ build_link() {
     if [ "${N_PROTO:-vless}" = "shadowsocks" ]; then
         userinfo=$(b64encode "$N_SS_METHOD:$N_SS_PASSWORD" | tr '+/' '-_' | tr -d '=')
         printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$ip" "$public_port" "$enc"
+        return 0
+    fi
+    if [ "${N_PROTO:-vless}" = "socks5" ]; then
+        user=$(urlencode "$N_SOCKS_USER")
+        pass=$(urlencode "$N_SOCKS_PASS")
+        printf 'socks5://%s:%s@%s:%s#%s\n' "$user" "$pass" "$ip" "$public_port" "$enc"
         return 0
     fi
     flow=""
@@ -2192,6 +2211,21 @@ JSON_HEAD
             printf '    }\n'
             continue
         fi
+        if [ "$N_PROTO" = "socks5" ]; then
+            printf '      "protocol": "socks",\n'
+            printf '      "settings": {\n'
+            printf '        "auth": "password",\n'
+            printf '        "accounts": [{"user": "%s", "pass": "%s"}],\n' "$N_SOCKS_USER" "$N_SOCKS_PASS"
+            printf '        "udp": true,\n'
+            if [ -n "$N_SOCKS_UDP_IP" ]; then
+                printf '        "ip": "%s",\n' "$N_SOCKS_UDP_IP"
+            fi
+            printf '        "userLevel": 0\n'
+            printf '      },\n'
+            printf '      "tag": "rysh-%s"\n' "$N_ID"
+            printf '    }\n'
+            continue
+        fi
         printf '      "protocol": "vless",\n'
         printf '      "settings": {\n'
         printf '        "clients": [\n'
@@ -2374,10 +2408,16 @@ apply_config() {
 }
 
 stats_query() {
+    users=$(stats_query_pattern "user>>>") || return 1
+    inbounds=$(stats_query_pattern "inbound>>>") || return 1
+    jq -nc --argjson u "$users" --argjson i "$inbounds" '{stat: (($u.stat // []) + ($i.stat // []))}'
+}
+
+stats_query_pattern() {
     if need_cmd timeout; then
-        timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
+        timeout 10 "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "$1" 2>/dev/null
     else
-        "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "user>>>" 2>/dev/null
+        "$XRAY_BIN" api statsquery --server="$API_ADDR" -pattern "$1" 2>/dev/null
     fi
 }
 
@@ -2392,13 +2432,24 @@ stats_query_user() {
 
 stats_user_baseline() {
     uid="$1"
-    json=$(stats_query_user "$uid") || return 1
+    prefix=$(node_stats_prefix "$uid") || return 1
+    json=$(stats_query 0) || return 1
     printf '%s' "$json" | jq -e . >/dev/null 2>&1 || return 1
-    up=$(printf '%s' "$json" | jq -r --arg n "user>>>n$uid>>>traffic>>>uplink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
-    down=$(printf '%s' "$json" | jq -r --arg n "user>>>n$uid>>>traffic>>>downlink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
+    up=$(printf '%s' "$json" | jq -r --arg n "${prefix}uplink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
+    down=$(printf '%s' "$json" | jq -r --arg n "${prefix}downlink" '[.stat[]? | select(.name==$n) | .value][0] // 0' 2>/dev/null)
     is_uint "$up" || up=0
     is_uint "$down" || down=0
     printf '%s %s\n' "$up" "$down"
+}
+
+node_stats_prefix() {
+    id="$1"
+    load_node "$id" || return 1
+    if [ "$N_PROTO" = "socks5" ]; then
+        printf 'inbound>>>rysh-%s>>>traffic>>>' "$id"
+    else
+        printf 'user>>>n%s>>>traffic>>>' "$id"
+    fi
 }
 
 reset_user_baseline() {
@@ -2558,10 +2609,12 @@ apply_blocklist() {
         fi
         clear_iptables_policy
         : > "$BLOCKED_FILE"
+        printf 'tcp+udp\n' > "$RYSH_DIR/blocked.protocols"
         return 0
     fi
     old=$(cat "$BLOCKED_FILE" 2>/dev/null)
-    [ "$ports" = "$old" ] && return 0
+    old_protocols=$(cat "$RYSH_DIR/blocked.protocols" 2>/dev/null)
+    [ "$ports" = "$old" ] && [ "$old_protocols" = "tcp+udp" ] && return 0
 
     clear_iptables_policy
 
@@ -2572,12 +2625,14 @@ apply_blocklist() {
             printf '    type filter hook input priority -200; policy accept;\n'
             for p in $ports; do
                 printf '    tcp dport %s drop\n' "$p"
+                printf '    udp dport %s drop\n' "$p"
             done
             printf '  }\n'
             printf '  chain output {\n'
             printf '    type filter hook output priority -200; policy accept;\n'
             for p in $ports; do
                 printf '    tcp sport %s drop\n' "$p"
+                printf '    udp sport %s drop\n' "$p"
             done
             printf '  }\n'
             printf '}\n'
@@ -2585,6 +2640,7 @@ apply_blocklist() {
         nft delete table inet rysh 2>/dev/null || true
         if nft -f "$RYSH_DIR/blocked.nft" 2>/dev/null; then
             printf '%s\n' "$ports" > "$BLOCKED_FILE"
+            printf 'tcp+udp\n' > "$RYSH_DIR/blocked.protocols"
             return 0
         fi
         warn "nftables 规则应用失败，尝试使用 iptables"
@@ -2598,8 +2654,11 @@ apply_blocklist() {
         for p in $ports; do
             iptables -A RYSH_IN -p tcp --dport "$p" -j DROP
             iptables -A RYSH_OUT -p tcp --sport "$p" -j DROP
+            iptables -A RYSH_IN -p udp --dport "$p" -j DROP
+            iptables -A RYSH_OUT -p udp --sport "$p" -j DROP
         done
         printf '%s\n' "$ports" > "$BLOCKED_FILE"
+        printf 'tcp+udp\n' > "$RYSH_DIR/blocked.protocols"
         return 0
     fi
 
@@ -2706,6 +2765,12 @@ apply_tc_rules() {
         else
             warn "节点 $id ingress 限速规则创建失败"
         fi
+        if ! tc filter add dev "$dev" egress chain "$TC_CHAIN" protocol all pref "$pref" flower ip_proto udp src_port "$N_PORT" action police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            warn "节点 $id UDP egress 限速规则创建失败"
+        fi
+        if ! tc filter add dev "$dev" ingress chain "$TC_CHAIN" protocol all pref "$pref" flower ip_proto udp dst_port "$N_PORT" action police rate "${kbit}kbit" burst 64k conform-exceed drop 2>/dev/null; then
+            warn "节点 $id UDP ingress 限速规则创建失败"
+        fi
         if [ "$added" -eq 1 ]; then
             printf '%s %s %s\n' "$dev" "$id" "$pref" >> "$state_tmp"
         fi
@@ -2789,8 +2854,9 @@ monitor_run() {
             S_MONTH_DOWN="0"
         fi
         if [ "$stats_ok" -eq 1 ]; then
-            up_key="user>>>n$id>>>traffic>>>uplink"
-            down_key="user>>>n$id>>>traffic>>>downlink"
+            stat_prefix=$(node_stats_prefix "$id")
+            up_key="${stat_prefix}uplink"
+            down_key="${stat_prefix}downlink"
             up_present=0
             down_present=0
             stat_exists "$stats_file" "$up_key" && up_present=1
@@ -3076,6 +3142,45 @@ new_ss2022_record() {
     printf '%s' "$id"
 }
 
+new_socks5_record() {
+    id=$(next_id)
+    password=$(openssl rand -hex 24 2>/dev/null | tr -d '\r\n')
+    [ "${#password}" -eq 48 ] || return 1
+    expires=0
+    if is_uint "$5"; then
+        days=$(to_int "$5")
+        [ "$days" -gt 0 ] && expires=$(( $(date +%s) + days * 86400 ))
+    fi
+    N_ID="$id"
+    N_PROTO="socks5"
+    N_NAME="$1"
+    N_PORT="$2"
+    N_PUBLIC_PORT="$2"
+    N_UUID=""
+    N_PRIV=""
+    N_PUB=""
+    N_SID=""
+    N_SNI=""
+    N_DEST=""
+    N_FLOW=""
+    N_FP=""
+    N_SOCKS_USER="n$id"
+    N_SOCKS_PASS="$password"
+    N_SOCKS_UDP_IP=""
+    N_ENABLED="1"
+    N_CREATED="$(date +%s)"
+    N_EXPIRES="$expires"
+    N_QUOTA_GB="$3"
+    N_RATE_MBPS="$4"
+    N_REMARK=""
+    N_OUT_MODE="inherit"
+    N_OUT_B64=""
+    N_OUT_LABEL=""
+    N_OUT_JSON=""
+    save_node || return 1
+    printf '%s' "$id"
+}
+
 create_node() {
     require_xray
     prepare_node_sni
@@ -3252,6 +3357,90 @@ create_ss2022_node() {
     monitor_run --quiet
     log_event "created SS2022 node $nid port $port"
     ok "SS2022 节点 $nid 创建成功"
+    load_node "$nid"
+    CACHED_IP=$(get_public_ip)
+    build_link
+    unset CACHED_IP
+}
+
+create_socks5_node() {
+    require_xray
+    id=$(next_id)
+    name="SOCKS5-$id"
+    prompt_default "节点名称" "$name"
+    name=$(sanitize_text "$REPLY")
+    [ -n "$name" ] || name="SOCKS5-$id"
+
+    auto=$(random_port) || die "找不到空闲端口"
+    prompt_default "端口" "$auto"
+    port=$(sanitize_text "$REPLY")
+    while ! validate_new_port "$port"; do
+        warn "端口无效、被占用或是 API 端口"
+        prompt_default "端口" "$auto"
+        port=$(sanitize_text "$REPLY")
+    done
+    port=$(to_int "$port")
+    prompt_default "面板外部映射端口 (直连填写同监听端口)" "$port"
+    public_port=$(sanitize_text "$REPLY")
+    while ! is_uint "$public_port" || [ "$(to_int "$public_port")" -lt 1 ] || [ "$(to_int "$public_port")" -gt 65535 ]; do
+        warn "请输入 1-65535 之间的外部端口"
+        prompt_default "面板外部映射端口" "$port"
+        public_port=$(sanitize_text "$REPLY")
+    done
+    public_port=$(to_int "$public_port")
+
+    prompt_default "SOCKS5 UDP 对外 IPv4 (NAT 映射可填写，留空自动)" ""
+    udp_ip=$(sanitize_text "$REPLY")
+    while [ -n "$udp_ip" ] && ! validate_ipv4 "$udp_ip"; do
+        warn "请输入有效 IPv4 地址或留空"
+        prompt_default "SOCKS5 UDP 对外 IPv4" ""
+        udp_ip=$(sanitize_text "$REPLY")
+    done
+
+    rate="0"
+    quota="0"
+    days="0"
+    printf '是否现在设置限速/月限额/到期时间? [y/N]: '
+    read -r adv 2>/dev/null || adv=""
+    case "$adv" in
+        y|Y)
+            prompt_default "限速 Mbps (0=不限)" "0"
+            rate=$(sanitize_text "$REPLY")
+            while ! is_number "$rate"; do
+                warn "请输入数字"
+                prompt_default "限速 Mbps (0=不限)" "0"
+                rate=$(sanitize_text "$REPLY")
+            done
+            prompt_default "月流量限额 GB (0=不限)" "0"
+            quota=$(sanitize_text "$REPLY")
+            while ! is_number "$quota"; do
+                warn "请输入数字"
+                prompt_default "月流量限额 GB (0=不限)" "0"
+                quota=$(sanitize_text "$REPLY")
+            done
+            prompt_default "有效期天数 (0=永久)" "0"
+            days=$(sanitize_text "$REPLY")
+            while ! is_uint "$days"; do
+                warn "请输入整数天数"
+                prompt_default "有效期天数 (0=永久)" "0"
+                days=$(sanitize_text "$REPLY")
+            done
+            ;;
+    esac
+
+    nid=$(new_socks5_record "$name" "$port" "$quota" "$rate" "$days") || die "创建 SOCKS5 节点失败"
+    load_node "$nid"
+    N_PUBLIC_PORT="$public_port"
+    N_SOCKS_UDP_IP="$udp_ip"
+    save_node || warn "节点已创建，但外部映射端口保存失败"
+    if ! apply_config; then
+        warn "节点已保存，但配置应用失败，请检查后重试"
+        return 1
+    fi
+    apply_tc_all
+    monitor_run --quiet
+    log_event "created SOCKS5 node $nid port $port"
+    ok "SOCKS5 节点 $nid 创建成功（UDP 已启用）"
     load_node "$nid"
     CACHED_IP=$(get_public_ip)
     build_link
@@ -3541,6 +3730,10 @@ show_node_detail() {
     if [ "$N_PROTO" = "shadowsocks" ]; then
         printf '加密方法 : %s\n' "$N_SS_METHOD"
         printf '密码     : %s\n' "$N_SS_PASSWORD"
+    elif [ "$N_PROTO" = "socks5" ]; then
+        printf '用户名   : %s\n' "$N_SOCKS_USER"
+        printf '密码     : %s\n' "$N_SOCKS_PASS"
+        printf 'UDP      : 已启用\n'
     else
         printf 'SNI      : %s\n' "$N_SNI"
         printf '目标     : %s\n' "$N_DEST"
@@ -3799,6 +3992,11 @@ modify_node() {
             printf '10. 修改外部映射端口 11. 设置出口\n'
             printf '12. 修改 SS2022 加密方法  13. 重置 SS2022 密钥\n'
             printf '14. 管理路由规则\n'
+        elif [ "$N_PROTO" = "socks5" ]; then
+            printf ' 1. 修改名称        2. 修改监听端口\n'
+            printf ' 8. 修改备注        9. 查看节点链接\n'
+            printf '10. 修改外部映射端口 11. 设置出口\n'
+            printf '12. 管理路由规则  13. 重置 SOCKS5 密码\n'
         else
             printf ' 1. 修改名称        2. 修改监听端口\n'
             printf ' 3. 修改 SNI/目标   4. 修改流控\n'
@@ -3967,8 +4165,15 @@ modify_node() {
                 fi
                 ;;
             13)
-                [ "$N_PROTO" = "shadowsocks" ] || { warn "无效选项"; continue; }
-                N_SS_PASSWORD=$(gen_ss2022_password "$N_SS_METHOD") || { warn "密钥生成失败"; continue; }
+                if [ "$N_PROTO" = "shadowsocks" ]; then
+                    N_SS_PASSWORD=$(gen_ss2022_password "$N_SS_METHOD") || { warn "密钥生成失败"; continue; }
+                elif [ "$N_PROTO" = "socks5" ]; then
+                    N_SOCKS_PASS=$(openssl rand -hex 24 2>/dev/null | tr -d '\r\n')
+                    [ "${#N_SOCKS_PASS}" -eq 48 ] || { warn "密码生成失败"; continue; }
+                else
+                    warn "无效选项"
+                    continue
+                fi
                 save_node && apply_config || warn "配置应用失败"
                 CACHED_IP=$(get_public_ip)
                 printf '\n%s\n' "$(build_link)"
@@ -4226,8 +4431,9 @@ live_monitor() {
         for id in $ids; do
             load_node "$id" || continue
             load_state "$id"
-            cu=$(get_stat "$stats_file" "user>>>n$id>>>traffic>>>uplink")
-            cd=$(get_stat "$stats_file" "user>>>n$id>>>traffic>>>downlink")
+            stat_prefix=$(node_stats_prefix "$id")
+            cu=$(get_stat "$stats_file" "${stat_prefix}uplink")
+            cd=$(get_stat "$stats_file" "${stat_prefix}downlink")
             pu=$(cat "$tmpdir/$id.up" 2>/dev/null)
             pd=$(cat "$tmpdir/$id.down" 2>/dev/null)
             if [ "$first" -eq 1 ]; then
@@ -5097,7 +5303,7 @@ reset_all_credentials() {
     fi
     count=$(printf '%s\n' $ids | wc -l | tr -d ' ')
     if [ "${RYSH_ASSUME_YES:-0}" != "1" ]; then
-        printf '将重置 %s 个节点的协议凭据（UUID、Reality 密钥或 SS2022 密钥），客户端需重新导入。继续? [y/N]: ' "$count"
+        printf '将重置 %s 个节点的协议凭据（UUID、Reality/SS2022 密钥或 SOCKS5 密码），客户端需重新导入。继续? [y/N]: ' "$count"
         read -r a 2>/dev/null || a=""
         case "$a" in
             y|Y) ;;
@@ -5116,6 +5322,16 @@ reset_all_credentials() {
                 continue
             }
             save_node || { failed=$((failed + 1)); continue; }
+            changed=$((changed + 1))
+            continue
+        fi
+        if [ "$N_PROTO" = "socks5" ]; then
+            N_SOCKS_PASS=$(openssl rand -hex 24 2>/dev/null | tr -d '\r\n')
+            if [ "${#N_SOCKS_PASS}" -ne 48 ] || ! save_node; then
+                warn "节点 $id SOCKS5 密码生成或保存失败，已跳过"
+                failed=$((failed + 1))
+                continue
+            fi
             changed=$((changed + 1))
             continue
         fi
@@ -5311,7 +5527,7 @@ main_menu() {
             esac
         done
         printf '%s============================================================%s\n' "$C_CYAN" "$C_NC"
-        printf '%s rysh %s - Xray Reality 多节点管理%s\n' "$C_BOLD" "$RYSH_VERSION" "$C_NC"
+        printf '%s rysh %s - Xray 多协议节点管理%s\n' "$C_BOLD" "$RYSH_VERSION" "$C_NC"
         printf ' 系统: %s | %s / %s\n' "$(os_pretty_name)" "$(container_label)" "$(init_system_name)"
         printf ' 节点: %s | Xray: %s | 本月总流量: %s\n' \
             "$node_count" "$(xray_status_text)" "$(human_bytes "$month_total")"
@@ -5334,6 +5550,7 @@ main_menu() {
         printf '25. 测试节点连通性             26. Reality SNI 检测\n'
         printf '27. NAT VPS 部署检查           28. 设置节点出口\n'
         printf '29. 创建 SS2022 节点           30. 配置域名路由\n'
+        printf '31. 创建 SOCKS5 节点\n'
         printf '                                   0. 退出\n'
         printf '请输入选项: '
         read -r choice 2>/dev/null || exit 0
@@ -5369,6 +5586,7 @@ main_menu() {
             28) set_node_outbound_menu; pause ;;
             29) create_ss2022_node; pause ;;
             30) route_rules_menu_for_id "" ;;
+            31) create_socks5_node; pause ;;
             0) return 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -5377,7 +5595,7 @@ main_menu() {
 
 usage() {
     cat <<'USAGE_EOF'
-rysh - Xray Reality 多节点管理脚本（跨发行版 / Podman）
+rysh - Xray 多协议节点管理脚本（Reality / SS2022 / SOCKS5）
 
 用法:
   ry                       进入交互菜单（rysh 的快捷命令）
